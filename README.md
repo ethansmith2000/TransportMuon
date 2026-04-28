@@ -1,5 +1,7 @@
 # MuonWarm Optimizer
 
+Blog post: [https://ethansmith2000.substack.com/p/transport-muon-beating-muon-in-speed](https://ethansmith2000.substack.com/p/transport-muon-beating-muon-in-speed)
+
 `muon_warm.py` defines `MuonWarm`, a PyTorch optimizer for matrix-shaped neural network parameters. It is a Muon-style optimizer that orthogonalizes momentum updates with Newton-Schulz iterations, then reuses a cached polar direction between full refreshes to reduce per-step work. Non-matrix parameters are handled with an Adam update.
 
 ## What It Does
