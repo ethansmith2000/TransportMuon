@@ -1,13 +1,8 @@
 import importlib
-import sys
-import types
 
 import torch
 
 
-muon_stub = types.ModuleType("muon")
-muon_stub.adam_update = lambda *args, **kwargs: args[0]
-sys.modules.setdefault("muon", muon_stub)
 muon_warm = importlib.import_module("muon_warm")
 muon_warm_aurora = importlib.import_module("muon_warm_aurora")
 

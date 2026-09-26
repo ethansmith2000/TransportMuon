@@ -111,6 +111,7 @@ def main() -> None:
                 "higham_cubic",
                 5,
                 args.inner_retract_steps,
+                True,
                 args.normal_cap,
                 -1.0,
             )

@@ -27,6 +27,10 @@ from muon_warm import (  # noqa: E402
     _prepare_muon_matrix,
     _row_ns_retract,
     _warm_polar_jacobi_step,
+    _warm_polar_jacobi_step_power_cap,
+    _warm_polar_jacobi_step_power_cap_with_stats,
+    _warm_polar_jacobi_step_power_step_cap,
+    _warm_polar_jacobi_step_power_step_cap_with_stats,
     _warm_polar_jacobi_step_with_stats,
 )
 
@@ -57,12 +61,21 @@ def main() -> None:
     parser.add_argument("--warm-retract-steps", type=int, default=1)
     parser.add_argument("--anchor-retract-steps", type=int, default=2)
     parser.add_argument(
+        "--spectral-cap-mode",
+        choices=("gershgorin", "power", "power_step"),
+        default="gershgorin",
+    )
+    parser.add_argument("--power-steps", type=int, default=2)
+    parser.add_argument("--power-safety-factor", type=float, default=1.25)
+    parser.add_argument("--normal-inv-cap", type=float, default=0.0)
+    parser.add_argument(
         "--polar-method",
         choices=("muon", "polar_express"),
         default="muon",
     )
     parser.add_argument("--polar-steps", type=int, default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     polar_steps = args.polar_steps
     if polar_steps is None:
@@ -74,6 +87,7 @@ def main() -> None:
     )
     device = torch.device(args.device)
 
+    records = []
     for rows in args.rows:
         identity = torch.eye(rows, device=device, dtype=torch.bfloat16)
         q_previous = torch.cat((identity, torch.zeros_like(identity)), dim=1)
@@ -86,7 +100,60 @@ def main() -> None:
         )
         work_matrix, _ = _prepare_muon_matrix(target)
 
+        power_vectors = {False: None, True: None, "controlled": None}
+        power_metrics = {}
+
         def warm(track_subspace: bool):
+            if args.spectral_cap_mode == "power_step":
+                result = _warm_polar_jacobi_step_power_step_cap(
+                    work_matrix,
+                    q_previous,
+                    1.0,
+                    1e-3,
+                    args.retract_method,
+                    args.warm_retract_steps,
+                    track_subspace,
+                    None,
+                    "floor",
+                    power_vectors[track_subspace],
+                    args.power_steps,
+                    args.power_safety_factor,
+                    1.0,
+                    1.0,
+                    args.normal_inv_cap,
+                )
+                power_vectors[track_subspace] = result[1]
+                power_metrics[track_subspace] = {
+                    "estimated_top_singular": result[2],
+                    "input_scale": result[3],
+                    "probe_top_singular": result[4],
+                    "transport_step_scale": result[5],
+                }
+                return result[0]
+            if args.spectral_cap_mode == "power":
+                result = _warm_polar_jacobi_step_power_cap(
+                    work_matrix,
+                    q_previous,
+                    1.0,
+                    1e-3,
+                    args.retract_method,
+                    args.warm_retract_steps,
+                    track_subspace,
+                    None,
+                    "floor",
+                    power_vectors[track_subspace],
+                    args.power_steps,
+                    args.power_safety_factor,
+                    1.0,
+                    1.0,
+                    args.normal_inv_cap,
+                )
+                power_vectors[track_subspace] = result[1]
+                power_metrics[track_subspace] = {
+                    "estimated_top_singular": result[2],
+                    "input_scale": result[3],
+                }
+                return result[0]
             return _warm_polar_jacobi_step(
                 work_matrix,
                 q_previous,
@@ -97,9 +164,60 @@ def main() -> None:
                 track_subspace,
                 None,
                 "floor",
+                0.0,
+                -1.0,
+                1.0,
+                1.0,
+                args.normal_inv_cap,
             )
 
         def controlled_warm():
+            if args.spectral_cap_mode == "power_step":
+                result = _warm_polar_jacobi_step_power_step_cap_with_stats(
+                    work_matrix,
+                    q_previous,
+                    1.0,
+                    1e-3,
+                    args.retract_method,
+                    args.warm_retract_steps,
+                    True,
+                    None,
+                    "floor",
+                    0.05,
+                    1e-4,
+                    None,
+                    power_vectors["controlled"],
+                    args.power_steps,
+                    args.power_safety_factor,
+                    1.0,
+                    1.0,
+                    args.normal_inv_cap,
+                )
+                power_vectors["controlled"] = result[2]
+                return result[0]
+            if args.spectral_cap_mode == "power":
+                result = _warm_polar_jacobi_step_power_cap_with_stats(
+                    work_matrix,
+                    q_previous,
+                    1.0,
+                    1e-3,
+                    args.retract_method,
+                    args.warm_retract_steps,
+                    True,
+                    None,
+                    "floor",
+                    0.05,
+                    1e-4,
+                    None,
+                    power_vectors["controlled"],
+                    args.power_steps,
+                    args.power_safety_factor,
+                    1.0,
+                    1.0,
+                    args.normal_inv_cap,
+                )
+                power_vectors["controlled"] = result[2]
+                return result[0]
             return _warm_polar_jacobi_step_with_stats(
                 work_matrix,
                 q_previous,
@@ -112,6 +230,10 @@ def main() -> None:
                 "floor",
                 0.05,
                 1e-4,
+                None,
+                1.0,
+                1.0,
+                args.normal_inv_cap,
             )
 
         rotation_only = warm(False).float()
@@ -128,6 +250,10 @@ def main() -> None:
             "columns": 2 * rows,
             "retract_method": args.retract_method,
             "warm_retract_steps": args.warm_retract_steps,
+            "spectral_cap_mode": args.spectral_cap_mode,
+            "power_steps": args.power_steps,
+            "power_safety_factor": args.power_safety_factor,
+            "normal_inv_cap": args.normal_inv_cap,
             "anchor_retract_steps": args.anchor_retract_steps,
             "polar_method": args.polar_method,
             "polar_steps": polar_steps,
@@ -160,7 +286,26 @@ def main() -> None:
                 device,
             ),
         }
+        if True in power_metrics:
+            record["power_estimated_top_singular"] = float(
+                power_metrics[True]["estimated_top_singular"]
+            )
+            record["power_input_scale"] = float(
+                power_metrics[True]["input_scale"]
+            )
+            if "probe_top_singular" in power_metrics[True]:
+                record["power_probe_top_singular"] = float(
+                    power_metrics[True]["probe_top_singular"]
+                )
+                record["power_transport_step_scale"] = float(
+                    power_metrics[True]["transport_step_scale"]
+                )
+        records.append(record)
         print(json.dumps(record, sort_keys=True))
+
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

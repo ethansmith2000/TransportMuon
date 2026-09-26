@@ -1,13 +1,9 @@
 import importlib
-import sys
-import types
+import math
 
 import torch
 
 
-muon_stub = types.ModuleType("muon")
-muon_stub.adam_update = lambda *args, **kwargs: args[0]
-sys.modules.setdefault("muon", muon_stub)
 muon_warm = importlib.import_module("muon_warm")
 procrustes = importlib.import_module("muon_warm_procrustes")
 
@@ -59,6 +55,7 @@ def test_procrustes_improves_dense_stretch_rotation(monkeypatch):
         "higham_cubic",
         5,
         2,
+        True,
         0.0,
         -1.0,
     )
@@ -97,6 +94,7 @@ def test_normal_trust_region_caps_applied_motion(monkeypatch):
         "higham_cubic",
         5,
         2,
+        True,
         0.01,
         -1.0,
     )
@@ -106,6 +104,99 @@ def test_normal_trust_region_caps_applied_motion(monkeypatch):
     assert normal_rms > 0.01
     assert applied_normal_rms <= 0.010001
     assert accepted == 1.0
+
+
+def test_normal_residual_is_measured_explicitly_in_float32(monkeypatch):
+    rows = 4
+    angle = 0.02
+    q_previous = torch.cat((torch.eye(rows), torch.zeros(rows, rows)), dim=1)
+    target = torch.cat(
+        (
+            torch.cos(torch.tensor(angle)) * torch.eye(rows),
+            torch.sin(torch.tensor(angle)) * torch.eye(rows),
+        ),
+        dim=1,
+    ).to(torch.bfloat16)
+    monkeypatch.setattr(
+        procrustes,
+        "_muon_ns5_prepared",
+        _eager(muon_warm._muon_ns5_prepared),
+    )
+
+    _, stats = _eager(procrustes._procrustes_transport_step)(
+        target,
+        q_previous.to(torch.bfloat16),
+        None,
+        1.0,
+        1e-3,
+        "tikhonov",
+        "higham_cubic",
+        0,
+        "higham_cubic",
+        5,
+        2,
+        True,
+        0.0,
+        -1.0,
+    )
+
+    expected = math.tan(angle)
+    assert abs(float(stats[1]) - expected) < 2e-3
+
+
+def test_disabling_subspace_tracking_omits_normal_correction(monkeypatch):
+    rows = 4
+    q_previous = torch.cat((torch.eye(rows), torch.zeros(rows, rows)), dim=1)
+    target = torch.cat((0.8 * torch.eye(rows), 0.6 * torch.eye(rows)), dim=1)
+    monkeypatch.setattr(
+        procrustes,
+        "_muon_ns5_prepared",
+        _eager(muon_warm._muon_ns5_prepared),
+    )
+
+    q_next, stats = _eager(procrustes._procrustes_transport_step)(
+        target.to(torch.bfloat16),
+        q_previous.to(torch.bfloat16),
+        None,
+        1.0,
+        1e-3,
+        "tikhonov",
+        "higham_cubic",
+        0,
+        "higham_cubic",
+        5,
+        2,
+        False,
+        0.0,
+        -1.0,
+    )
+
+    assert stats[1] == 0.0
+    assert torch.equal(q_next[:, rows:], torch.zeros_like(q_next[:, rows:]))
+
+
+def test_procrustes_rejects_unsupported_inherited_tangent_controllers():
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    for option in ("muon_warm_max_tangent_rms", "muon_warm_max_tangent_ratio"):
+        try:
+            procrustes.MuonWarmProcrustes(
+                [{"params": [parameter], "use_muon": True}],
+                **{option: 1.0},
+            )
+        except ValueError as error:
+            assert option in str(error)
+        else:
+            raise AssertionError(f"{option} should be rejected")
+
+    try:
+        procrustes.MuonWarmProcrustes(
+            [{"params": [parameter], "use_muon": True}],
+            muon_warm_angular_scale=0.5,
+        )
+    except ValueError as error:
+        assert "muon_warm_angular_scale" in str(error)
+    else:
+        raise AssertionError("partial Procrustes rotation should be rejected")
 
 
 def test_optimizer_records_procrustes_step_statistics(monkeypatch):

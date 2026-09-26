@@ -70,6 +70,7 @@ def _procrustes_transport_step(
     inner_retract_method: str,
     inner_ns_steps: int,
     inner_retract_steps: int,
+    track_subspace: bool,
     max_normal_rms: float,
     alignment_tolerance: float = -1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -97,15 +98,23 @@ def _procrustes_transport_step(
         jacobi_damping,
     )
 
-    # For row-orthonormal Q, diag(M(I-Q.T Q)M.T) can be obtained without
-    # explicitly forming the residual or another large matrix product.
-    residual_row_squares = (
-        work_matrix.square().sum(dim=1, dtype=torch.float32)
-        - r.mT.square().sum(dim=1, dtype=torch.float32)
-    ).clamp_min(0.0)
-    normal_rms = (
-        inverse_diagonal.float().square() * residual_row_squares
-    ).sum().sqrt() / math.sqrt(max(1, rows))
+    q_rotated = rotation.float() @ q_prev.float()
+    use_normal_correction = (
+        track_subspace and work_matrix.shape[-1] > work_matrix.shape[-2]
+    )
+    if use_normal_correction:
+        # Form this residual explicitly in FP32. The algebraically equivalent
+        # difference ||M||^2 - ||M Q.T||^2 loses its useful digits in BF16 when
+        # Q already tracks M closely, precisely where the trust controller needs
+        # an accurate signal.
+        normal_residual = work_matrix.float() - (
+            rotated_alignment.float().mT @ q_rotated
+        )
+        normal_correction = inverse_diagonal.float().unsqueeze(1) * normal_residual
+        normal_rms = normal_correction.norm() / math.sqrt(max(1, rows))
+    else:
+        normal_correction = torch.zeros_like(q_rotated)
+        normal_rms = q_rotated.new_tensor(0.0)
 
     effective_eta = work_matrix.new_tensor(float(eta), dtype=torch.float32)
     if max_normal_rms > 0.0:
@@ -114,19 +123,9 @@ def _procrustes_transport_step(
             effective_eta,
             cap / normal_rms.clamp_min(1e-12),
         )
-    eta_compute = effective_eta.to(work_matrix.dtype)
-
-    identity = torch.eye(rows, device=work_matrix.device, dtype=work_matrix.dtype)
-    coefficient = (
-        identity
-        - eta_compute
-        * inverse_diagonal.unsqueeze(1)
-        * rotated_alignment.mT
-    ) @ rotation
     q_tilde = (
-        eta_compute * inverse_diagonal.unsqueeze(1) * work_matrix
-        + coefficient @ q_prev
-    )
+        q_rotated + effective_eta * normal_correction
+    ).to(work_matrix.dtype)
     q_next = _row_ns_retract(q_tilde, retract_steps, retract_method)
 
     accepted = effective_eta.new_tensor(1.0)
@@ -180,6 +179,22 @@ class MuonWarmProcrustes(MuonWarm):
             raise ValueError("muon_warm_inner_retract_steps must be >= 1")
         if float(muon_warm_max_normal_rms) < 0.0:
             raise ValueError("muon_warm_max_normal_rms must be non-negative")
+        if float(kwargs.get("muon_warm_max_tangent_rms", 0.0)) > 0.0:
+            raise ValueError(
+                "MuonWarmProcrustes does not apply muon_warm_max_tangent_rms "
+                "to its exact in-space rotation; use muon_warm_max_normal_rms "
+                "to cap its complementary correction"
+            )
+        if float(kwargs.get("muon_warm_max_tangent_ratio", 0.0)) > 0.0:
+            raise ValueError(
+                "MuonWarmProcrustes does not yet support "
+                "muon_warm_max_tangent_ratio"
+            )
+        if float(kwargs.get("muon_warm_angular_scale", 1.0)) != 1.0:
+            raise ValueError(
+                "MuonWarmProcrustes applies its exact in-space rotation fully "
+                "and requires muon_warm_angular_scale=1"
+            )
         self.muon_warm_inner_ns_steps = int(muon_warm_inner_ns_steps)
         self.muon_warm_inner_retract_steps = int(
             muon_warm_inner_retract_steps
@@ -195,18 +210,25 @@ class MuonWarmProcrustes(MuonWarm):
         state,
         transposed,
     ):
+        warm_index = int(state.get("muon_warm_age", 0)) + 1
+        retract_now = warm_index % self.muon_warm_retract_every == 0
+        retract_steps = (
+            int(self.muon_warm_retract_steps) if retract_now else 0
+        )
+        state["muon_warm_did_retract"] = bool(retract_steps > 0)
         q_next, stats = _procrustes_transport_step(
             tracking_matrix,
             q_prev,
             alignment_matrix,
-            float(self.muon_warm_lr),
+            float(self.muon_warm_lr * self.muon_warm_normal_scale),
             float(self.muon_warm_jacobi_eps),
             self.muon_warm_jacobi_damping,
             self.muon_warm_retract_method,
-            max(1, int(self.muon_warm_retract_steps)),
+            retract_steps,
             self.muon_warm_anchor_retract_method,
             self.muon_warm_inner_ns_steps,
             self.muon_warm_inner_retract_steps,
+            self.muon_warm_track_subspace,
             self.muon_warm_max_normal_rms,
             self.muon_warm_alignment_tolerance,
         )

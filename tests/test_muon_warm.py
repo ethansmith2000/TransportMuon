@@ -1,14 +1,10 @@
 import importlib
 import math
-import sys
-import types
 
+import pytest
 import torch
 
 
-muon_stub = types.ModuleType("muon")
-muon_stub.adam_update = lambda *args, **kwargs: args[0]
-sys.modules.setdefault("muon", muon_stub)
 muon_warm = importlib.import_module("muon_warm")
 
 
@@ -41,6 +37,95 @@ def test_rectangular_transport_tracks_row_space_motion():
     assert tangent_error < 1e-4 * rotation_error
 
 
+def test_separate_normal_scale_controls_row_space_motion():
+    size = 4
+    q_previous = torch.cat((torch.eye(size), torch.zeros(size, size)), dim=1)
+    target = torch.cat((0.8 * torch.eye(size), 0.6 * torch.eye(size)), dim=1)
+    warm_step = _eager(muon_warm._warm_polar_jacobi_step)
+
+    without_normal = warm_step(
+        target,
+        q_previous,
+        1.0,
+        1e-3,
+        "higham_cubic",
+        0,
+        True,
+        None,
+        "floor",
+        0.0,
+        -1.0,
+        1.0,
+        0.0,
+    )
+    with_normal = warm_step(
+        target,
+        q_previous,
+        1.0,
+        1e-3,
+        "higham_cubic",
+        0,
+        True,
+        None,
+        "floor",
+        0.0,
+        -1.0,
+        1.0,
+        1.0,
+    )
+
+    assert torch.equal(without_normal, q_previous)
+    assert (with_normal - target).norm() < (without_normal - target).norm()
+
+
+def test_separate_angular_scale_controls_in_space_rotation():
+    angle = 0.1
+    q_previous = torch.eye(2)
+    target = torch.tensor(
+        [
+            [math.cos(angle), -math.sin(angle)],
+            [math.sin(angle), math.cos(angle)],
+        ]
+    )
+    warm_step = _eager(muon_warm._warm_polar_jacobi_step)
+
+    disabled = warm_step(
+        target, q_previous, 1.0, 1e-3, "higham_cubic", 0,
+        True, None, "floor", 0.0, -1.0, 0.0, 1.0,
+    )
+    enabled = warm_step(
+        target, q_previous, 1.0, 1e-3, "higham_cubic", 0,
+        True, None, "floor", 0.0, -1.0, 1.0, 1.0,
+    )
+
+    assert torch.equal(disabled, q_previous)
+    assert (enabled - target).norm() < (disabled - target).norm()
+
+
+def test_lazy_retraction_follows_configured_warm_cadence(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_warm_retract_steps=1,
+        muon_warm_retract_every=2,
+    )
+    calls = []
+
+    def fake_step(*arguments, **kwargs):
+        calls.append(arguments[5])
+        return arguments[1]
+
+    monkeypatch.setattr(muon_warm, "_warm_polar_jacobi_step", fake_step)
+    q = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1)
+    state = {"muon_warm_age": 0}
+    optimizer._compute_warm_direction(q, q, None, state, False)
+    assert state["muon_warm_did_retract"] is False
+    state["muon_warm_age"] = 1
+    optimizer._compute_warm_direction(q, q, None, state, False)
+    assert state["muon_warm_did_retract"] is True
+    assert calls == [0, 1]
+
+
 def test_alignment_metrics_detect_row_space_motion_with_zero_skew():
     size = 4
     angle = 0.1
@@ -53,10 +138,41 @@ def test_alignment_metrics_detect_row_space_motion_with_zero_skew():
 
     _, metrics = metrics_function(target, q_previous)
 
-    rotation_error, subspace_error, relative_alignment = metrics.tolist()
+    (
+        rotation_error,
+        subspace_error,
+        relative_alignment,
+        relative_min_stretch,
+    ) = metrics.tolist()
     assert rotation_error == 0.0
     assert abs(subspace_error - math.sin(angle)) < 1e-5
     assert relative_alignment > 0.99
+    assert relative_min_stretch > 0.99
+
+
+def test_alignment_metrics_detect_symmetric_indefinite_wrong_branch():
+    q_previous = torch.cat((torch.eye(2), torch.zeros(2, 2)), dim=1)
+    stretch = torch.tensor([[1.0, 2.0], [2.0, 1.0]])
+    work_matrix = stretch @ q_previous
+    metrics_function = _eager(muon_warm._warm_alignment_metrics)
+
+    _, metrics = metrics_function(work_matrix, q_previous)
+
+    rotation_error, subspace_error, _, relative_min_stretch = metrics.tolist()
+    assert rotation_error == 0.0
+    assert subspace_error == 0.0
+    assert relative_min_stretch < 0.0
+
+
+def test_zero_retraction_steps_are_an_exact_noop():
+    torch.manual_seed(23)
+    matrix = torch.randn(4, 8)
+
+    retracted = muon_warm._row_ns_retract(
+        matrix, 0, "higham_cubic", cap_spectral_norm=True
+    )
+
+    assert retracted is matrix
 
 
 def test_tikhonov_jacobi_scale_is_bounded_near_zero_denominator():
@@ -128,6 +244,180 @@ def test_uncapped_anchor_polish_avoids_loose_gershgorin_scale():
     assert uncapped_error < 0.5 * capped_error
 
 
+def test_power_cap_is_less_conservative_than_dense_gershgorin_bound():
+    torch.manual_seed(21)
+    rows, columns = 32, 64
+    left = torch.linalg.qr(torch.randn(rows, rows)).Q
+    right = torch.linalg.qr(torch.randn(columns, rows)).Q.T
+    singular_values = torch.linspace(0.7, 1.2, rows)
+    candidate = (
+        left @ torch.diag(singular_values) @ right
+    ).to(torch.bfloat16)
+    gershgorin = muon_warm._row_ns_retract(
+        candidate, 1, "higham_cubic", True
+    )
+    power, vector, estimate, scale = muon_warm._row_ns_retract_power_cap(
+        candidate,
+        1,
+        "higham_cubic",
+        None,
+        2,
+        1.25,
+    )
+    identity = torch.eye(rows)
+    gershgorin_error = (
+        gershgorin.float() @ gershgorin.float().T - identity
+    ).norm()
+    power_error = (
+        power.float() @ power.float().T - identity
+    ).norm()
+
+    assert vector.shape == (rows,)
+    assert estimate > 1.0
+    assert 0.0 < scale < 1.0
+    assert power_error < 0.6 * gershgorin_error
+
+
+def test_power_cap_fresh_seed_detects_a_direction_missed_by_cache():
+    singular_values = torch.tensor([1.0, 1.0, 1.0, 2.0])
+    candidate = torch.diag(singular_values).to(torch.bfloat16)
+    stale_vector = torch.tensor([1.0, 0.0, 0.0, 0.0])
+
+    _, next_vector, estimate, scale = muon_warm._row_ns_retract_power_cap(
+        candidate,
+        1,
+        "higham_cubic",
+        stale_vector,
+        2,
+        1.25,
+    )
+
+    assert estimate == pytest.approx(2.0)
+    assert scale == pytest.approx(0.5)
+    assert next_vector.argmax() == 3
+
+
+def test_optimizer_caches_power_cap_vector_and_diagnostics(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=0,
+        muon_warm_full_ns_steps=0,
+        muon_warm_spectral_cap_mode="power",
+        muon_warm_power_steps=2,
+        muon_warm_power_safety_factor=1.25,
+    )
+    state = {
+        "step": 2,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": torch.cat(
+            (torch.eye(4), torch.zeros(4, 4)), dim=1
+        ).to(torch.bfloat16),
+    }
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_polar_jacobi_step_power_cap",
+        _eager(muon_warm._warm_polar_jacobi_step_power_cap),
+    )
+
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+
+    assert state["muon_warm_power_vector"].shape == (4,)
+    assert state["muon_warm_power_vector"].isfinite().all()
+    assert state["muon_warm_power_sigma_tensor"].isfinite()
+    assert 0.0 < state["muon_warm_spectral_cap_scale_tensor"] <= 1.0
+
+
+def test_power_step_cap_preserves_unaffected_singular_directions():
+    rows = 4
+    q_previous = torch.cat(
+        (torch.eye(rows), torch.zeros(rows, rows)), dim=1
+    ).to(torch.bfloat16)
+    correction = torch.cat(
+        (
+            torch.zeros(rows, rows),
+            torch.diag(torch.tensor([0.1, 1.0, 10.0, 100.0])),
+        ),
+        dim=1,
+    ).to(torch.bfloat16)
+    whole_candidate = q_previous + correction
+    whole_scaled, _, _, _ = muon_warm._row_ns_retract_power_cap(
+        whole_candidate,
+        1,
+        "higham_cubic",
+        None,
+        2,
+        1.05,
+    )
+    (
+        step_capped,
+        _,
+        _,
+        final_scale,
+        probe_sigma,
+        step_scale,
+    ) = muon_warm._row_ns_retract_power_step_cap(
+        q_previous,
+        correction,
+        torch.tensor(1.0),
+        1,
+        "higham_cubic",
+        None,
+        2,
+        1.05,
+    )
+    identity = torch.eye(rows)
+    whole_error = (
+        whole_scaled.float() @ whole_scaled.float().T - identity
+    ).norm()
+    step_error = (
+        step_capped.float() @ step_capped.float().T - identity
+    ).norm()
+
+    assert probe_sigma > 90.0
+    assert step_scale < 0.01
+    assert final_scale == 1.0
+    assert step_error < 0.1 * whole_error
+
+
+def test_optimizer_records_power_step_scale(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=0,
+        muon_warm_full_ns_steps=0,
+        muon_warm_spectral_cap_mode="power_step",
+        muon_warm_power_steps=2,
+        muon_warm_power_safety_factor=1.05,
+    )
+    state = {
+        "step": 2,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": torch.cat(
+            (torch.eye(4), torch.zeros(4, 4)), dim=1
+        ).to(torch.bfloat16),
+    }
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_polar_jacobi_step_power_step_cap",
+        _eager(muon_warm._warm_polar_jacobi_step_power_step_cap),
+    )
+
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+
+    assert state["muon_warm_power_step_samples"] == 1
+    assert state["muon_warm_power_probe_sigma_tensor"].isfinite()
+    assert 0.0 < state["muon_warm_spectral_step_scale_tensor"] <= 1.0
+
+
 def test_polar_express_six_steps_need_no_extra_polish():
     torch.manual_seed(22)
     matrix = torch.randn(32, 64)
@@ -161,11 +451,86 @@ def test_tangent_trust_region_reduces_effective_step():
         -1.0,
     )
 
-    effective_eta, tangent_rms, accepted = stats
+    effective_eta, tangent_rms, accepted, angular_rms, normal_rms = stats[:5]
     assert effective_eta < 1.0
     assert tangent_rms > 0.05
     assert effective_eta * tangent_rms <= 0.050001
     assert accepted == 1.0
+    assert angular_rms >= 0.0
+    assert normal_rms > 0.0
+
+
+def test_normal_inverse_cap_limits_ill_conditioned_rectangular_correction():
+    q_previous = torch.cat((torch.eye(2), torch.zeros(2, 2)), dim=1)
+    target = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1e-3, 0.0, 1.0],
+        ]
+    )
+    warm_step = _eager(muon_warm._warm_polar_jacobi_step_with_stats)
+
+    uncapped, uncapped_stats = warm_step(
+        target,
+        q_previous,
+        1.0,
+        1e-3,
+        "higham_cubic",
+        0,
+        True,
+        None,
+        "tikhonov",
+        0.0,
+        -1.0,
+        None,
+        1.0,
+        1.0,
+        0.0,
+    )
+    capped, capped_stats = warm_step(
+        target,
+        q_previous,
+        1.0,
+        1e-3,
+        "higham_cubic",
+        0,
+        True,
+        None,
+        "tikhonov",
+        0.0,
+        -1.0,
+        None,
+        1.0,
+        1.0,
+        2.0,
+    )
+
+    assert uncapped_stats[6] > 100.0
+    assert torch.equal(capped_stats[6], uncapped_stats[6])
+    assert capped_stats[7] > 0.0
+    assert capped_stats[4] < 0.01 * uncapped_stats[4]
+    assert (capped - q_previous).norm() < 0.01 * (uncapped - q_previous).norm()
+
+
+def test_angular_signal_path_matches_instrumented_warm_step():
+    q_previous = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1)
+    target = torch.randn(4, 8)
+    signal_step = _eager(
+        muon_warm._warm_polar_jacobi_step_with_angular_signal
+    )
+    stats_step = _eager(muon_warm._warm_polar_jacobi_step_with_stats)
+
+    signaled, angular_signal = signal_step(
+        target, q_previous, 1.0, 1e-3, "higham_cubic", 1,
+        True, None, "tikhonov", 1.0, 1.0, 4.0,
+    )
+    instrumented, stats = stats_step(
+        target, q_previous, 1.0, 1e-3, "higham_cubic", 1,
+        True, None, "tikhonov", 0.0, -1.0, None, 1.0, 1.0, 4.0,
+    )
+
+    assert torch.equal(signaled, instrumented)
+    assert torch.equal(angular_signal, stats[3])
 
 
 def test_alignment_gate_rejects_an_overshooting_step():
@@ -227,6 +592,11 @@ def test_optimizer_records_device_side_controller_statistics(monkeypatch):
 
     assert state["muon_warm_effective_eta_tensor"].ndim == 0
     assert state["muon_warm_tangent_rms_tensor"].isfinite()
+    assert state["muon_warm_angular_rms_tensor"].isfinite()
+    assert state["muon_warm_normal_rms_tensor"].isfinite()
+    assert state["muon_warm_max_tangent_rms_tensor"].isfinite()
+    assert state["muon_warm_max_applied_tangent_rms_tensor"] <= 0.050001
+    assert state["muon_warm_min_effective_eta_tensor"] <= 1.0
     assert state["muon_warm_step_accepted_tensor"] in (0.0, 1.0)
     assert not state["muon_warm_did_anchor"]
     assert state["muon_warm_age"] == 1
@@ -262,6 +632,136 @@ def test_stats_mode_measures_tangent_without_changing_eta(monkeypatch):
     assert state["muon_warm_effective_eta_tensor"] == 1.0
     assert state["muon_warm_tangent_rms_tensor"] > 0.0
     assert state["muon_warm_step_accepted_tensor"] == 1.0
+
+
+def test_update_stats_compare_warm_direction_with_fresh_anchor(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True, "lr": 0.01}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=0,
+        muon_warm_full_ns_steps=0,
+        muon_warm_record_stats=True,
+        muon_warm_update_stats_every=1,
+        muon_warm_reference_lr_ratio=0.25,
+    )
+    state = {
+        "step": 2,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": torch.cat(
+            (torch.eye(4), torch.zeros(4, 4)), dim=1
+        ).to(torch.bfloat16),
+    }
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_polar_jacobi_step_with_stats",
+        _eager(muon_warm._warm_polar_jacobi_step_with_stats),
+    )
+    monkeypatch.setattr(
+        muon_warm,
+        "_muon_ns5_prepared",
+        _eager(muon_warm._muon_ns5_prepared),
+    )
+
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+
+    assert state["muon_update_samples"] == 1
+    assert state["muon_reference_samples"] == 1
+    assert state["muon_update_elements"] == parameter.numel()
+    assert state["muon_reference_elements"] == parameter.numel()
+    for key in (
+        "muon_update_direction_sq_sum_tensor",
+        "muon_update_applied_sq_sum_tensor",
+        "muon_reference_direction_sq_sum_tensor",
+        "muon_reference_direction_dot_sum_tensor",
+        "muon_reference_difference_sq_sum_tensor",
+        "muon_reference_candidate_applied_sq_sum_tensor",
+        "muon_reference_applied_sq_sum_tensor",
+    ):
+        assert state[key].isfinite()
+    assert state["muon_reference_applied_sq_sum_tensor"] < state[
+        "muon_reference_candidate_applied_sq_sum_tensor"
+    ]
+    assert state["muon_update_stats_by_age"][1]["samples"] == 1
+    assert state["muon_update_stats_by_age"][1]["reference_samples"] == 1
+    age_stats = state["muon_update_stats_by_age"][1]
+    for predictor in (
+        "momentum_innovation_ratio",
+        "tangent_rms",
+        "angular_rms",
+        "normal_rms",
+        "relative_max_abs_inverse",
+        "normal_inverse_clipped_fraction",
+    ):
+        for suffix in (
+            "sample",
+            "value",
+            "value_sq",
+            "error",
+            "error_sq",
+            "value_error",
+        ):
+            assert age_stats[
+                f"refresh_predictor_{predictor}_{suffix}_sum_tensor"
+            ].isfinite()
+
+
+def test_output_normalization_restores_muon_direction_norm(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=0,
+        muon_warm_full_ns_steps=0,
+        muon_warm_normalize_output=True,
+    )
+    state = {
+        "step": 2,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": torch.cat(
+            (torch.eye(4), torch.zeros(4, 4)), dim=1
+        ).to(torch.bfloat16),
+    }
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_polar_jacobi_step",
+        _eager(muon_warm._warm_polar_jacobi_step),
+    )
+
+    update = optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+
+    assert update.float().norm() == pytest.approx(math.sqrt(4), rel=2e-2)
+
+
+def test_output_normalization_uses_flattened_convolution_rows(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(6, 4, 3, 3))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=1,
+        muon_warm_full_ns_steps=0,
+        muon_warm_normalize_output=True,
+    )
+    state = {"step": 1, "momentum_fast": torch.zeros_like(parameter)}
+    monkeypatch.setattr(
+        muon_warm,
+        "_muon_ns5_prepared",
+        _eager(muon_warm._muon_ns5_prepared),
+    )
+
+    update = optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+
+    assert update.shape == parameter.shape
+    assert update.float().norm() == pytest.approx(math.sqrt(6), rel=2e-2)
 
 
 def test_tensor_scalar_history_caps_tangent_spikes(monkeypatch):
@@ -380,6 +880,201 @@ def test_minimum_alignment_alone_can_trigger_anchor(monkeypatch):
 
     assert calls == [True]
     assert state["muon_warm_relative_alignment"] < 0.5
+
+
+def test_minimum_stretch_rejects_symmetric_indefinite_branch(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(2, 4))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=0,
+        muon_warm_full_ns_steps=0,
+        muon_warm_min_stretch=0.01,
+    )
+    q_previous = torch.cat((torch.eye(2), torch.zeros(2, 2)), dim=1)
+    gradient = torch.tensor([[1.0, 2.0], [2.0, 1.0]]) @ q_previous
+    state = {
+        "step": 2,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": q_previous.to(torch.bfloat16),
+    }
+    calls = []
+
+    def fake_anchor(work_matrix, _steps):
+        calls.append(True)
+        return work_matrix
+
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_alignment_metrics",
+        _eager(muon_warm._warm_alignment_metrics),
+    )
+    monkeypatch.setattr(muon_warm, "_muon_ns5_prepared", fake_anchor)
+    monkeypatch.setattr(muon_warm, "_row_ns_retract", lambda value, *_: value)
+
+    optimizer._muon_update_warm(gradient, state, optimizer.param_groups[0])
+
+    assert calls == [True]
+    assert state["muon_warm_relative_min_stretch"] < 0.0
+    assert state["muon_warm_did_anchor"]
+
+
+def test_maximum_warm_age_triggers_anchor_with_reason(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=0,
+        muon_warm_full_ns_steps=0,
+        muon_warm_max_age=3,
+    )
+    q_previous = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1).to(
+        torch.bfloat16
+    )
+    state = {
+        "step": 4,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": q_previous,
+        "muon_warm_age": 3,
+    }
+    monkeypatch.setattr(muon_warm, "_muon_ns5_prepared", lambda value, _: value)
+    monkeypatch.setattr(muon_warm, "_row_ns_retract", lambda value, *_: value)
+
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+
+    assert state["muon_warm_did_anchor"]
+    assert state["muon_warm_anchor_reason"] == "max_age"
+    assert state["muon_warm_age"] == 0
+    assert state["muon_warm_anchor_counts"] == {"max_age": 1}
+
+
+def test_angular_signal_batches_checks_and_triggers_anchor(monkeypatch):
+    parameters = [
+        torch.nn.Parameter(torch.zeros(4, 8)),
+        torch.nn.Parameter(torch.zeros(4, 8)),
+    ]
+    optimizer = muon_warm.MuonWarm(
+        [{"params": parameters, "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=0,
+        muon_warm_full_ns_steps=0,
+        muon_warm_check_every=4,
+        muon_warm_max_angular_rms=10.0,
+    )
+    q_previous = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1).to(
+        torch.bfloat16
+    )
+    for parameter, signal in zip(parameters, (20.0, 5.0)):
+        optimizer.state[parameter].update(
+            {
+                "step": 3,
+                "momentum_fast": torch.zeros_like(parameter),
+                "muon_warm_q": q_previous.clone(),
+                "muon_warm_angular_signal_tensor": torch.tensor(signal),
+            }
+        )
+
+    optimizer._prepare_angular_anchor_flags()
+
+    assert optimizer.state[parameters[0]]["muon_warm_force_angular_anchor"]
+    assert not optimizer.state[parameters[1]]["muon_warm_force_angular_anchor"]
+    assert optimizer.state[parameters[0]]["muon_warm_angular_checks"] == 1
+    assert optimizer.state[parameters[1]]["muon_warm_angular_checks"] == 1
+
+    monkeypatch.setattr(muon_warm, "_muon_ns5_prepared", lambda value, _: value)
+    monkeypatch.setattr(muon_warm, "_row_ns_retract", lambda value, *_: value)
+    optimizer.state[parameters[0]]["step"] = 4
+    optimizer._muon_update_warm(
+        torch.randn_like(parameters[0]),
+        optimizer.state[parameters[0]],
+        optimizer.param_groups[0],
+    )
+
+    assert optimizer.state[parameters[0]]["muon_warm_did_anchor"]
+    assert optimizer.state[parameters[0]]["muon_warm_anchor_reason"] == "angular_rms"
+    assert optimizer.state[parameters[0]]["muon_warm_anchor_counts"] == {
+        "angular_rms": 1
+    }
+
+
+def test_rejection_streak_is_checked_without_per_step_sync(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=0,
+        muon_warm_full_ns_steps=0,
+        muon_warm_alignment_tolerance=0.0,
+        muon_warm_max_rejection_streak=2,
+        muon_warm_check_every=1,
+    )
+    q_previous = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1).to(
+        torch.bfloat16
+    )
+    state = {
+        "step": 4,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": q_previous,
+        "muon_warm_rejection_streak_tensor": torch.tensor(2.0),
+    }
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_alignment_metrics",
+        _eager(muon_warm._warm_alignment_metrics),
+    )
+    monkeypatch.setattr(muon_warm, "_muon_ns5_prepared", lambda value, _: value)
+    monkeypatch.setattr(muon_warm, "_row_ns_retract", lambda value, *_: value)
+
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+
+    assert state["muon_warm_did_anchor"]
+    assert state["muon_warm_anchor_reason"] == "rejection_streak"
+    assert state["muon_warm_rejection_streak_tensor"] == 0.0
+
+
+def test_rejection_streak_requires_alignment_gate():
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    try:
+        muon_warm.MuonWarm(
+            [{"params": [parameter], "use_muon": True}],
+            muon_warm_max_rejection_streak=2,
+        )
+    except ValueError as error:
+        assert "alignment_tolerance" in str(error)
+    else:
+        raise AssertionError("rejection streak without a gate should be rejected")
+
+
+def test_normal_inverse_cap_must_be_non_negative():
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    with pytest.raises(ValueError, match="normal_inv_cap"):
+        muon_warm.MuonWarm(
+            [{"params": [parameter], "use_muon": True}],
+            muon_warm_normal_inv_cap=-1.0,
+        )
+
+
+def test_angular_anchor_threshold_validates_configuration():
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    with pytest.raises(ValueError, match="max_angular_rms"):
+        muon_warm.MuonWarm(
+            [{"params": [parameter], "use_muon": True}],
+            muon_warm_max_angular_rms=-1.0,
+        )
+    with pytest.raises(ValueError, match="gershgorin"):
+        muon_warm.MuonWarm(
+            [{"params": [parameter], "use_muon": True}],
+            muon_warm_max_angular_rms=10.0,
+            muon_warm_spectral_cap_mode="power",
+        )
 
 
 def test_aspect_ratio_scaling_does_not_modify_cached_polar(monkeypatch):
