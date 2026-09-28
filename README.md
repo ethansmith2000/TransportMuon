@@ -125,9 +125,37 @@ optimizer.zero_grad(set_to_none=True)
 - `muon_warm_max_angular_rms`: anchor when the previous warm step's proposed
   in-row-space angular correction exceeds this RMS threshold. `0` disables the
   controller. Checks are batched into one device-to-host transfer every
-  `muon_warm_check_every` steps and currently require the default
-  `"gershgorin"` spectral-cap mode. This is an experimental diagnostic control;
-  the included OpenWebText threshold screen did not beat fixed period eight.
+  `muon_warm_check_every` steps. The controller supports `"gershgorin"` and
+  `"power_step"`; the latter uses a dedicated angular-only compiled path rather
+  than the full statistics kernel. With the local output filter, threshold `2`
+  checked every four steps passed the three-seed OpenWebText gate and repaired
+  the batch-480 teacher stress failure, then matched the ungated profile at
+  2,000 steps. The raw threshold remains experimental because it is sensitive
+  to dtype and compiled arithmetic.
+- `muon_warm_max_skew_ratio`: anchor when
+  `||skew(Q M^T)||_F / ||Q M^T||_F` from the previous warm step exceeds this
+  dimensionless threshold. `0` disables it. It is mutually exclusive with the
+  raw angular-RMS controller and currently requires `"power_step"`. A dedicated
+  compiled path reuses the alignment product already needed by transport, then
+  batches the scalar checks at `muon_warm_check_every` just like the angular
+  controller. Threshold `0.52`, checked every four steps, passed the CUDA
+  batch-480 teacher stress screen, the three-seed 1,000-step OpenWebText gate,
+  and the 2,000-step survivor. It is the current dimensionless quality profile:
+  its 1,000-step mean loss (`6.54368`) nearly matches raw angular threshold 2
+  (`6.54325`), while its 2,000-step loss improves from `6.22535` to `6.21645`.
+  It uses about twice as many adaptive anchors and roughly `0.97` ms more
+  optimizer time at 1,000 steps, so the raw angular controller remains the
+  cheaper robust profile.
+- `muon_warm_async_checks`: replace the periodic blocking scalar read with a
+  nonblocking copy to reusable pinned host memory. A CUDA event is polled on
+  later optimizer steps, so a triggered refresh is deliberately delayed. If a
+  scheduled anchor occurs in between, the stale result is discarded. Default:
+  `False`; CPU execution keeps the synchronous path. Diagnostics report
+  submitted, completed, skipped, and stale checks. A matched threshold-0.50
+  CUDA stress screen regressed from `0.00024543` synchronously to `0.00027585`
+  asynchronously despite similar refresh counts. The delayed path therefore
+  remains a research option; removing host synchronization needs a device-side
+  or predictive policy rather than a late replay of the same decision.
 - `muon_warm_max_rejection_streak`: anchor at the next periodic check after this
   many alignment-gate rejections. It requires a non-negative
   `muon_warm_alignment_tolerance`; `0` disables it. The streak stays on-device
@@ -135,7 +163,7 @@ optimizer.zero_grad(set_to_none=True)
 - `muon_warm_check_every`: interval for adaptive tracking checks. Default: `1`.
   `state["muon_warm_anchor_reason"]` records `initial`, `state_reset`, `warmup`,
   `schedule`, `max_age`, `rejection_streak`, `tracking_error`, `alignment`,
-  `stretch`, `angular_rms`, or `warm`.
+  `stretch`, `angular_rms`, `skew_ratio`, or `warm`.
 - `muon_warm_stagger_anchors`: distribute scheduled anchors across parameters to
   smooth optimizer latency. Default: `False`.
 - `muon_warm_jacobi_damping`: `"floor"` preserves the original signed-floor
@@ -147,8 +175,9 @@ optimizer.zero_grad(set_to_none=True)
   with the current momentum does not fall by more than this relative tolerance.
   Negative values disable the gate. The decision and fallback stay on-device.
 - `muon_warm_record_stats`: use the instrumented warm path and record proposed
-  total, angular, and normal tangent RMS, relative diagonal conditioning, raw
-  inverse magnitude, and cap activation even when controllers are disabled.
+  total, angular, and normal tangent RMS, normalized skew ratio, relative
+  diagonal conditioning, raw inverse magnitude, and cap activation even when
+  controllers are disabled.
   Default: `False`, which preserves the fastest path.
 - `muon_warm_max_tangent_ratio`: tensor-wide scalar preconditioner that limits
   the current tangent RMS to this multiple of its historical EMA. `0` disables
@@ -170,6 +199,29 @@ optimizer.zero_grad(set_to_none=True)
   norm expected from an orthogonal Muon update while leaving the cached basis
   unchanged. Default: `False`; the included OpenWebText screen removed magnitude
   oscillation but worsened validation loss, so this remains an ablation.
+- `muon_warm_output_scale`: multiply warm-step updates by a fixed scalar after
+  retraction and output normalization, while leaving anchor updates and the
+  cached transported basis unchanged. Default: `1.0`. This is an attribution
+  control for testing whether the retained single-retraction method benefits
+  from its implicit magnitude filter. An RMS-matched scale of `0.2067`
+  recovered about 63% of the seed-123 loss gap between full-size
+  geometry-preserving transport and the retained update, but did not match the
+  retained loss.
+- `muon_warm_output_scale_start` and `muon_warm_output_scale_decay`: optionally
+  decay the warm output scale exponentially from `start` at warm age one toward
+  `muon_warm_output_scale`. The schedule uses the existing Python-side age and
+  adds no device reduction or synchronization. The default `start=None` keeps
+  the fixed-scale behavior above. The fitted schedule improved seed-123 loss
+  from `6.58420` to `6.58107`, still well behind the retained `6.54938`, so it
+  remains an attribution option.
+- `muon_warm_legacy_retraction_output`: with `power_step`, cache the
+  geometry-preserving direction but return the legacy capped one-retraction
+  direction computed from the same full candidate. This exact output-filter
+  path reuses the Gram already formed by the power-step probe. Cache retraction
+  can be disabled with `muon_warm_retract_steps=0`; the emitted direction still
+  receives its one local cubic filter. That no-cache profile improved all three
+  1,000-step OpenWebText seeds and the 2,000-step seed-123 gate. Default:
+  `False`.
 - `muon_warm_angular_scale`: relative scale for rotation inside the cached row
   space. Default: `1.0`.
 - `muon_warm_normal_scale`: relative scale for complementary row-space motion.
@@ -180,12 +232,29 @@ optimizer.zero_grad(set_to_none=True)
   `abs(D^-1) * mean(abs(D))` to this value before constructing the correction.
   `0` disables it. The bound adds no matrix multiply or optimizer-sized state;
   `4` is the retained experimental profile.
+- `muon_warm_normal_inv_ema_ratio`: optional tensor-scalar controller for the
+  rectangular normal inverse. It keeps an EMA of the inverse RMS after the
+  absolute cap and limits the next step to this multiple of that history. It
+  requires a positive `muon_warm_normal_inv_cap`; `0` disables it. Ratio `3`
+  improved the three-seed 1,000-step mean but lost to fixed cap 4 at 2,000
+  steps, so it remains an attribution setting rather than the retained profile.
+- `muon_warm_normal_inv_ema_beta`: EMA decay for that controller. Default:
+  `0.95`. The state is one control scalar per rectangular tensor plus small
+  diagnostic scalars, and all decisions remain on device.
 
 ## Tuning Notes
 
 - Start from `muon_lr=0.02`, `muon_momentum=0.95`, and `muon_ns_steps=5` if you are matching common Muon settings.
 - Increase `muon_warm_full_ns_steps` when early training is unstable or when the cached direction needs more time to settle.
 - Decrease `muon_warm_anchor_every` to refresh more often. This is more expensive but keeps the cached direction closer to a full Muon update.
+- For the experimental local-filter profile, start with period-eight anchors,
+  `power_step`, safety factor `1.05`, normal-inverse cap `4`, no cache
+  retraction, and the exact local output filter. Choose a check every four
+  steps with either raw angular threshold `2` for the lower-cost robust profile
+  or normalized skew-ratio threshold `0.52` for the dimensionless quality and
+  portability profile. Both remain experimental pending validation on the
+  reported nanoGPT batch-480 regime; the normalized controller is more
+  portable across scale and shape but currently refreshes about twice as often.
 - Keep `muon_warm_lr=1.0` as the local full-correction step and use
   `muon_warm_max_tangent_rms` to shrink only unusually large moves. This is a
   more targeted experiment than globally lowering the warm learning rate.
@@ -211,6 +280,9 @@ optimizer.zero_grad(set_to_none=True)
   trust controllers also record their effective step and acceptance as scalar
   device tensors. Instrumented runs accumulate the maximum proposed and applied
   tangent RMS and the minimum effective transport step without a host sync.
+- `muon_warm_warm_retractions` counts cache repairs, while
+  `muon_warm_output_retractions` counts local filters applied to emitted warm
+  updates. Keeping these counters separate makes the no-cache profile explicit.
 - The angular refresh controller reuses the correction already formed by the
   warm update. It adds one scalar reduction per active matrix and batches all
   decisions on a device into one periodic synchronization; it does not build an
@@ -437,6 +509,14 @@ opt-in: it also improved the 2,000-step seed-123 gate (`6.23355` to `6.23110`)
 and both seeds in the batch-480 teacher-MLP stress check, but anchor periods 12
 and 16 regressed to `6.56584` and `6.58126`. It controls denominator outliers
 without making a longer fixed warm lifetime safe.
+
+An EMA-relative scalar was tested on top of cap 4. Ratio 2 over-damped the
+seed-123 run (`6.55078`). Ratio 3 improved all three 1,000-step seeds, moving
+their mean from `6.55448` to `6.55376` with similar measured optimizer time.
+The gain did not survive the longer gate: at 2,000 steps it reached `6.23242`
+versus `6.23110` for fixed cap 4. The implementation is available in
+`llm_openwebtext_transport_normal_inv_cap4_ema_ratio3_1000.json`, but the
+supplied retained profile continues to use only the fixed cap.
 
 The spectral-step profile avoids whole-candidate shrinkage:
 

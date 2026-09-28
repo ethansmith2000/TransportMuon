@@ -246,6 +246,8 @@ def _row_ns_retract_power_step_cap(
     power_vector=None,
     power_steps: int = 2,
     safety_factor: float = 1.05,
+    legacy_retraction_output: bool = False,
+    legacy_retract_steps: int = 1,
 ):
     """Shrink the transport step before retraction, then recheck its spectrum.
 
@@ -275,6 +277,17 @@ def _row_ns_retract_power_step_cap(
         torch.ones_like(probe_sigma),
         (numerator / denominator).clamp(min=0.0, max=1.0),
     )
+    legacy_output = q_probe
+    if legacy_retraction_output:
+        # The full-candidate Gram was already needed by the spectral probe.
+        # Reuse it for the attribution output instead of rebuilding the same
+        # Gram in a second retraction call.
+        legacy_output = _row_ns_retract_from_gram(
+            q_probe,
+            probe_gram,
+            legacy_retract_steps,
+            ns_method,
+        )
     adjusted = q_prev + (
         eta * step_scale
     ).to(q_prev.dtype) * correction
@@ -295,6 +308,7 @@ def _row_ns_retract_power_step_cap(
         final_scale,
         probe_sigma,
         step_scale,
+        legacy_output,
     )
 
 
@@ -321,6 +335,39 @@ def _row_ns_retract(
         )
         return function(X, num_iters)
     raise ValueError(f"Unknown muon_warm_retract_method: {ns_method!r}")
+
+
+def _row_ns_retract_from_gram(
+    X,
+    gram,
+    num_iters: int,
+    ns_method: str,
+):
+    """Apply a capped row retraction using an already computed input Gram."""
+    if num_iters <= 0:
+        return X
+
+    upper_sq = gram.abs().sum(dim=-1).amax(dim=-1, keepdim=True).unsqueeze(-1)
+    scale = (ROW_NS_MAX_SINGULAR / (upper_sq.sqrt() + 1e-7)).clamp(max=1.0)
+    Z = X * scale
+    gram = gram * scale.square()
+    identity = torch.eye(
+        gram.shape[-1], device=gram.device, dtype=gram.dtype
+    )
+    for step in range(num_iters):
+        error = gram - identity
+        if ns_method == "higham_cubic":
+            correction = -0.5 * error + 0.375 * (error @ error)
+            Z = Z + correction @ Z
+        elif ns_method == "quadratic":
+            Z = Z - 0.5 * (error @ Z)
+        else:
+            raise ValueError(
+                f"Unknown muon_warm_retract_method: {ns_method!r}"
+            )
+        if step + 1 < num_iters:
+            gram = Z @ Z.mT
+    return Z
 
 # @torch.compile
 def _jacobi_scale(
@@ -396,6 +443,10 @@ def _warm_polar_jacobi_core(
     power_safety_factor: float = 1.25,
     normal_inv_cap: float = 0.0,
     measure_angular: bool = False,
+    dynamic_normal_inv_cap=None,
+    measure_normal_inv_observation: bool = False,
+    legacy_retraction_output: bool = False,
+    measure_skew_ratio: bool = False,
 ):
     # Muon prepares matrices with rows <= columns, so Q has near-orthonormal rows.
     # Polar alignment asks for Q @ M.T to be symmetric.
@@ -408,6 +459,9 @@ def _warm_polar_jacobi_core(
     relative_max_abs_inv = work_matrix.new_tensor(-1.0, dtype=torch.float32)
     normal_inv_clipped_fraction = work_matrix.new_tensor(
         0.0, dtype=torch.float32
+    )
+    normal_inv_observation_rms = work_matrix.new_tensor(
+        -1.0, dtype=torch.float32
     )
     if track_subspace and work_matrix.shape[-1] > work_matrix.shape[-2]:
         # A @ Q only rotates rows inside Q's current row space.  Rectangular
@@ -435,13 +489,46 @@ def _warm_polar_jacobi_core(
             relative_max_abs_inv = (
                 inv_diag.abs().amax().float() * mean_abs_diag.float()
             )
+        raw_inv_diag = inv_diag
+        fixed_cap = None
         if normal_inv_cap > 0.0:
-            max_abs_inv = float(normal_inv_cap) / mean_abs_diag
+            fixed_cap = mean_abs_diag.new_tensor(float(normal_inv_cap))
+            fixed_max_abs_inv = float(normal_inv_cap) / mean_abs_diag
+            fixed_inv_diag = inv_diag.clamp(
+                min=-fixed_max_abs_inv,
+                max=fixed_max_abs_inv,
+            )
+        else:
+            fixed_inv_diag = inv_diag
+        # Observe the distribution after the absolute safety cap but before the
+        # history-relative cap. This prevents the adaptive threshold from
+        # shrinking its own reference distribution through feedback.
+        if measure_tangent or measure_normal_inv_observation:
+            normal_inv_observation_rms = (
+                fixed_inv_diag.float().square().mean().sqrt()
+                * mean_abs_diag.float()
+            )
+        if dynamic_normal_inv_cap is not None:
+            effective_normal_inv_cap = (
+                dynamic_normal_inv_cap
+                if fixed_cap is None
+                else torch.minimum(fixed_cap, dynamic_normal_inv_cap)
+            )
+            max_abs_inv = effective_normal_inv_cap / mean_abs_diag
             if measure_tangent:
                 normal_inv_clipped_fraction = (
-                    inv_diag.abs() > max_abs_inv
+                    raw_inv_diag.abs() > max_abs_inv
                 ).float().mean()
-            inv_diag = inv_diag.clamp(min=-max_abs_inv, max=max_abs_inv)
+            inv_diag = fixed_inv_diag.clamp(
+                min=-max_abs_inv,
+                max=max_abs_inv,
+            )
+        else:
+            inv_diag = fixed_inv_diag
+            if measure_tangent and fixed_cap is not None:
+                normal_inv_clipped_fraction = (
+                    raw_inv_diag.abs() > fixed_max_abs_inv
+                ).float().mean()
         correction = float(normal_scale) * inv_diag.unsqueeze(1) * work_matrix
         correction = correction + (
             float(angular_scale) * A
@@ -454,6 +541,7 @@ def _warm_polar_jacobi_core(
     tangent_rms = effective_eta.new_tensor(-1.0)
     angular_rms = effective_eta.new_tensor(-1.0)
     normal_rms = effective_eta.new_tensor(-1.0)
+    skew_ratio = effective_eta.new_tensor(-1.0)
     if (
         measure_tangent
         or max_tangent_rms > 0.0
@@ -470,6 +558,12 @@ def _warm_polar_jacobi_core(
         angular_rms = (
             abs(float(angular_scale)) * A.float().norm() / scale
         )
+    if measure_tangent or measure_skew_ratio:
+        # This measures the scale-free violation of the polar stationarity
+        # condition Q M^T = (Q M^T)^T.  Unlike the Jacobi correction norm it
+        # does not grow mechanically with tensor size and is independent of
+        # matrix scale, damping, and eta.
+        skew_ratio = skew.float().norm() / R.float().norm().clamp_min(1e-12)
     if measure_tangent:
         if inv_diag is not None:
             # Move BF16 values to FP32 before squaring. This avoids the severe
@@ -514,6 +608,7 @@ def _warm_polar_jacobi_core(
             cap_scale,
             power_probe_sigma,
             spectral_step_scale,
+            output_direction,
         ) = _row_ns_retract_power_step_cap(
             q_prev,
             correction,
@@ -523,6 +618,8 @@ def _warm_polar_jacobi_core(
             power_vector,
             power_steps,
             power_safety_factor,
+            legacy_retraction_output,
+            1,
         )
         effective_eta = effective_eta * spectral_step_scale
     elif spectral_cap_mode == "power":
@@ -538,6 +635,8 @@ def _warm_polar_jacobi_core(
         )
     else:
         q_next = _row_ns_retract(q_tilde, retract_steps, retract_method)
+    if spectral_cap_mode != "power_step":
+        output_direction = q_next
 
     accepted = effective_eta.new_tensor(1.0)
     if alignment_tolerance >= 0.0:
@@ -547,6 +646,7 @@ def _warm_polar_jacobi_core(
             float(alignment_tolerance) * old_alignment.abs()
         ) >= old_alignment
         q_next = torch.where(accept, q_next, q_prev)
+        output_direction = torch.where(accept, output_direction, q_prev)
         accepted = accept.to(torch.float32)
     stats = torch.stack(
         (
@@ -558,6 +658,8 @@ def _warm_polar_jacobi_core(
             relative_min_abs_diag,
             relative_max_abs_inv,
             normal_inv_clipped_fraction,
+            normal_inv_observation_rms,
+            skew_ratio,
         )
     )
     return (
@@ -568,6 +670,7 @@ def _warm_polar_jacobi_core(
         cap_scale,
         power_probe_sigma,
         spectral_step_scale,
+        output_direction,
     )
 
 
@@ -642,6 +745,41 @@ def _warm_polar_jacobi_step_with_angular_signal(
 
 
 @torch.compile
+def _warm_polar_jacobi_step_with_normal_inv_observation(
+    work_matrix,
+    q_prev,
+    eta: float,
+    jacobi_eps: float,
+    retract_method: str,
+    retract_steps: int,
+    track_subspace: bool = True,
+    alignment_matrix=None,
+    jacobi_damping: str = "floor",
+    angular_scale: float = 1.0,
+    normal_scale: float = 1.0,
+    normal_inv_cap: float = 0.0,
+    dynamic_normal_inv_cap=None,
+):
+    result = _warm_polar_jacobi_core(
+        work_matrix,
+        q_prev,
+        eta,
+        jacobi_eps,
+        retract_method,
+        retract_steps,
+        track_subspace,
+        alignment_matrix,
+        jacobi_damping,
+        angular_scale=angular_scale,
+        normal_scale=normal_scale,
+        normal_inv_cap=normal_inv_cap,
+        dynamic_normal_inv_cap=dynamic_normal_inv_cap,
+        measure_normal_inv_observation=True,
+    )
+    return result[0], result[1][8]
+
+
+@torch.compile
 def _warm_polar_jacobi_step_with_stats(
     work_matrix,
     q_prev,
@@ -658,6 +796,7 @@ def _warm_polar_jacobi_step_with_stats(
     angular_scale: float = 1.0,
     normal_scale: float = 1.0,
     normal_inv_cap: float = 0.0,
+    dynamic_normal_inv_cap=None,
 ):
     result = _warm_polar_jacobi_core(
         work_matrix,
@@ -676,6 +815,7 @@ def _warm_polar_jacobi_step_with_stats(
         angular_scale,
         normal_scale,
         normal_inv_cap=normal_inv_cap,
+        dynamic_normal_inv_cap=dynamic_normal_inv_cap,
     )
     return result[0], result[1]
 
@@ -813,6 +953,333 @@ def _warm_polar_jacobi_step_power_step_cap(
 
 
 @torch.compile
+def _warm_polar_jacobi_step_power_step_cap_with_legacy_output(
+    work_matrix,
+    q_prev,
+    eta: float,
+    jacobi_eps: float,
+    retract_method: str,
+    retract_steps: int,
+    track_subspace: bool,
+    alignment_matrix,
+    jacobi_damping: str,
+    power_vector,
+    power_steps: int,
+    power_safety_factor: float,
+    angular_scale: float = 1.0,
+    normal_scale: float = 1.0,
+    normal_inv_cap: float = 0.0,
+):
+    result = _warm_polar_jacobi_core(
+        work_matrix,
+        q_prev,
+        eta,
+        jacobi_eps,
+        retract_method,
+        retract_steps,
+        track_subspace,
+        alignment_matrix,
+        jacobi_damping,
+        0.0,
+        -1.0,
+        False,
+        None,
+        angular_scale,
+        normal_scale,
+        "power_step",
+        power_vector,
+        power_steps,
+        power_safety_factor,
+        normal_inv_cap,
+        legacy_retraction_output=True,
+    )
+    return (
+        result[0],
+        result[7],
+        result[2],
+        result[3],
+        result[4],
+        result[5],
+        result[6],
+    )
+
+
+@torch.compile
+def _warm_polar_jacobi_step_power_step_cap_with_legacy_output_no_cache_retract(
+    work_matrix,
+    q_prev,
+    eta: float,
+    jacobi_eps: float,
+    retract_method: str,
+    retract_steps: int,
+    track_subspace: bool,
+    alignment_matrix,
+    jacobi_damping: str,
+    power_vector,
+    power_steps: int,
+    power_safety_factor: float,
+    angular_scale: float = 1.0,
+    normal_scale: float = 1.0,
+    normal_inv_cap: float = 0.0,
+):
+    # Keep lazy cache steps in a distinct compiled frame. Alternating zero and
+    # one retraction step in the same frame doubles its shape specializations
+    # and can exceed TorchDynamo's recompilation limit on transformer tensors.
+    result = _warm_polar_jacobi_core(
+        work_matrix,
+        q_prev,
+        eta,
+        jacobi_eps,
+        retract_method,
+        0,
+        track_subspace,
+        alignment_matrix,
+        jacobi_damping,
+        0.0,
+        -1.0,
+        False,
+        None,
+        angular_scale,
+        normal_scale,
+        "power_step",
+        power_vector,
+        power_steps,
+        power_safety_factor,
+        normal_inv_cap,
+        legacy_retraction_output=True,
+    )
+    return (
+        result[0],
+        result[7],
+        result[2],
+        result[3],
+        result[4],
+        result[5],
+        result[6],
+    )
+
+
+@torch.compile
+def _warm_polar_jacobi_step_power_step_cap_with_angular_signal(
+    work_matrix,
+    q_prev,
+    eta: float,
+    jacobi_eps: float,
+    retract_method: str,
+    retract_steps: int,
+    track_subspace: bool,
+    alignment_matrix,
+    jacobi_damping: str,
+    power_vector,
+    power_steps: int,
+    power_safety_factor: float,
+    legacy_retraction_output: bool,
+    angular_scale: float = 1.0,
+    normal_scale: float = 1.0,
+    normal_inv_cap: float = 0.0,
+):
+    result = _warm_polar_jacobi_core(
+        work_matrix,
+        q_prev,
+        eta,
+        jacobi_eps,
+        retract_method,
+        retract_steps,
+        track_subspace,
+        alignment_matrix,
+        jacobi_damping,
+        0.0,
+        -1.0,
+        False,
+        None,
+        angular_scale,
+        normal_scale,
+        "power_step",
+        power_vector,
+        power_steps,
+        power_safety_factor,
+        normal_inv_cap,
+        measure_angular=True,
+        legacy_retraction_output=legacy_retraction_output,
+    )
+    return (
+        result[0],
+        result[7],
+        result[1][3],
+        result[2],
+        result[3],
+        result[4],
+        result[5],
+        result[6],
+    )
+
+
+@torch.compile
+def _warm_polar_jacobi_step_power_step_cap_with_angular_signal_no_cache_retract(
+    work_matrix,
+    q_prev,
+    eta: float,
+    jacobi_eps: float,
+    retract_method: str,
+    retract_steps: int,
+    track_subspace: bool,
+    alignment_matrix,
+    jacobi_damping: str,
+    power_vector,
+    power_steps: int,
+    power_safety_factor: float,
+    legacy_retraction_output: bool,
+    angular_scale: float = 1.0,
+    normal_scale: float = 1.0,
+    normal_inv_cap: float = 0.0,
+):
+    result = _warm_polar_jacobi_core(
+        work_matrix,
+        q_prev,
+        eta,
+        jacobi_eps,
+        retract_method,
+        0,
+        track_subspace,
+        alignment_matrix,
+        jacobi_damping,
+        0.0,
+        -1.0,
+        False,
+        None,
+        angular_scale,
+        normal_scale,
+        "power_step",
+        power_vector,
+        power_steps,
+        power_safety_factor,
+        normal_inv_cap,
+        measure_angular=True,
+        legacy_retraction_output=legacy_retraction_output,
+    )
+    return (
+        result[0],
+        result[7],
+        result[1][3],
+        result[2],
+        result[3],
+        result[4],
+        result[5],
+        result[6],
+    )
+
+
+@torch.compile
+def _warm_polar_jacobi_step_power_step_cap_with_skew_ratio_signal(
+    work_matrix,
+    q_prev,
+    eta: float,
+    jacobi_eps: float,
+    retract_method: str,
+    retract_steps: int,
+    track_subspace: bool,
+    alignment_matrix,
+    jacobi_damping: str,
+    power_vector,
+    power_steps: int,
+    power_safety_factor: float,
+    legacy_retraction_output: bool,
+    angular_scale: float = 1.0,
+    normal_scale: float = 1.0,
+    normal_inv_cap: float = 0.0,
+):
+    result = _warm_polar_jacobi_core(
+        work_matrix,
+        q_prev,
+        eta,
+        jacobi_eps,
+        retract_method,
+        retract_steps,
+        track_subspace,
+        alignment_matrix,
+        jacobi_damping,
+        0.0,
+        -1.0,
+        False,
+        None,
+        angular_scale,
+        normal_scale,
+        "power_step",
+        power_vector,
+        power_steps,
+        power_safety_factor,
+        normal_inv_cap,
+        legacy_retraction_output=legacy_retraction_output,
+        measure_skew_ratio=True,
+    )
+    return (
+        result[0],
+        result[7],
+        result[1][9],
+        result[2],
+        result[3],
+        result[4],
+        result[5],
+        result[6],
+    )
+
+
+@torch.compile
+def _warm_polar_jacobi_step_power_step_cap_with_skew_ratio_signal_no_cache_retract(
+    work_matrix,
+    q_prev,
+    eta: float,
+    jacobi_eps: float,
+    retract_method: str,
+    retract_steps: int,
+    track_subspace: bool,
+    alignment_matrix,
+    jacobi_damping: str,
+    power_vector,
+    power_steps: int,
+    power_safety_factor: float,
+    legacy_retraction_output: bool,
+    angular_scale: float = 1.0,
+    normal_scale: float = 1.0,
+    normal_inv_cap: float = 0.0,
+):
+    result = _warm_polar_jacobi_core(
+        work_matrix,
+        q_prev,
+        eta,
+        jacobi_eps,
+        retract_method,
+        0,
+        track_subspace,
+        alignment_matrix,
+        jacobi_damping,
+        0.0,
+        -1.0,
+        False,
+        None,
+        angular_scale,
+        normal_scale,
+        "power_step",
+        power_vector,
+        power_steps,
+        power_safety_factor,
+        normal_inv_cap,
+        legacy_retraction_output=legacy_retraction_output,
+        measure_skew_ratio=True,
+    )
+    return (
+        result[0],
+        result[7],
+        result[1][9],
+        result[2],
+        result[3],
+        result[4],
+        result[5],
+        result[6],
+    )
+
+
+@torch.compile
 def _warm_polar_jacobi_step_power_step_cap_with_stats(
     work_matrix,
     q_prev,
@@ -857,6 +1324,118 @@ def _warm_polar_jacobi_step_power_step_cap_with_stats(
     )
     return (
         result[0],
+        result[1],
+        result[2],
+        result[3],
+        result[4],
+        result[5],
+        result[6],
+    )
+
+
+@torch.compile
+def _warm_polar_jacobi_step_power_step_cap_with_stats_and_legacy_output(
+    work_matrix,
+    q_prev,
+    eta: float,
+    jacobi_eps: float,
+    retract_method: str,
+    retract_steps: int,
+    track_subspace: bool,
+    alignment_matrix,
+    jacobi_damping: str,
+    max_tangent_rms: float,
+    alignment_tolerance: float,
+    dynamic_tangent_cap,
+    power_vector,
+    power_steps: int,
+    power_safety_factor: float,
+    angular_scale: float = 1.0,
+    normal_scale: float = 1.0,
+    normal_inv_cap: float = 0.0,
+):
+    result = _warm_polar_jacobi_core(
+        work_matrix,
+        q_prev,
+        eta,
+        jacobi_eps,
+        retract_method,
+        retract_steps,
+        track_subspace,
+        alignment_matrix,
+        jacobi_damping,
+        max_tangent_rms,
+        alignment_tolerance,
+        True,
+        dynamic_tangent_cap,
+        angular_scale,
+        normal_scale,
+        "power_step",
+        power_vector,
+        power_steps,
+        power_safety_factor,
+        normal_inv_cap,
+        legacy_retraction_output=True,
+    )
+    return (
+        result[0],
+        result[7],
+        result[1],
+        result[2],
+        result[3],
+        result[4],
+        result[5],
+        result[6],
+    )
+
+
+@torch.compile
+def _warm_polar_jacobi_step_power_step_cap_with_stats_and_legacy_output_no_cache_retract(
+    work_matrix,
+    q_prev,
+    eta: float,
+    jacobi_eps: float,
+    retract_method: str,
+    retract_steps: int,
+    track_subspace: bool,
+    alignment_matrix,
+    jacobi_damping: str,
+    max_tangent_rms: float,
+    alignment_tolerance: float,
+    dynamic_tangent_cap,
+    power_vector,
+    power_steps: int,
+    power_safety_factor: float,
+    angular_scale: float = 1.0,
+    normal_scale: float = 1.0,
+    normal_inv_cap: float = 0.0,
+):
+    result = _warm_polar_jacobi_core(
+        work_matrix,
+        q_prev,
+        eta,
+        jacobi_eps,
+        retract_method,
+        0,
+        track_subspace,
+        alignment_matrix,
+        jacobi_damping,
+        max_tangent_rms,
+        alignment_tolerance,
+        True,
+        dynamic_tangent_cap,
+        angular_scale,
+        normal_scale,
+        "power_step",
+        power_vector,
+        power_steps,
+        power_safety_factor,
+        normal_inv_cap,
+        legacy_retraction_output=True,
+    )
+    return (
+        result[0],
+        result[7],
         result[1],
         result[2],
         result[3],
@@ -928,10 +1507,18 @@ class MuonWarm(torch.optim.Optimizer):
         muon_warm_angular_scale=1.0,
         muon_warm_normal_scale=1.0,
         muon_warm_normal_inv_cap=0.0,
+        muon_warm_normal_inv_ema_ratio=0.0,
+        muon_warm_normal_inv_ema_beta=0.95,
         muon_warm_max_angular_rms=0.0,
+        muon_warm_max_skew_ratio=0.0,
+        muon_warm_async_checks=False,
         muon_warm_update_stats_every=0,
         muon_warm_reference_lr_ratio=1.0,
         muon_warm_normalize_output=False,
+        muon_warm_output_scale=1.0,
+        muon_warm_output_scale_start=None,
+        muon_warm_output_scale_decay=1.0,
+        muon_warm_legacy_retraction_output=False,
         muon_warm_spectral_cap_mode="gershgorin",
         muon_warm_power_steps=2,
         muon_warm_power_safety_factor=1.25,
@@ -974,18 +1561,39 @@ class MuonWarm(torch.optim.Optimizer):
         self.muon_warm_angular_scale = float(muon_warm_angular_scale)
         self.muon_warm_normal_scale = float(muon_warm_normal_scale)
         self.muon_warm_normal_inv_cap = float(muon_warm_normal_inv_cap)
+        self.muon_warm_normal_inv_ema_ratio = float(
+            muon_warm_normal_inv_ema_ratio
+        )
+        self.muon_warm_normal_inv_ema_beta = float(
+            muon_warm_normal_inv_ema_beta
+        )
         self.muon_warm_max_angular_rms = float(muon_warm_max_angular_rms)
+        self.muon_warm_max_skew_ratio = float(muon_warm_max_skew_ratio)
+        self.muon_warm_async_checks = bool(muon_warm_async_checks)
         self.muon_warm_update_stats_every = int(muon_warm_update_stats_every)
         self.muon_warm_reference_lr_ratio = float(
             muon_warm_reference_lr_ratio
         )
         self.muon_warm_normalize_output = bool(muon_warm_normalize_output)
+        self.muon_warm_output_scale = float(muon_warm_output_scale)
+        self.muon_warm_output_scale_start = (
+            None
+            if muon_warm_output_scale_start is None
+            else float(muon_warm_output_scale_start)
+        )
+        self.muon_warm_output_scale_decay = float(
+            muon_warm_output_scale_decay
+        )
+        self.muon_warm_legacy_retraction_output = bool(
+            muon_warm_legacy_retraction_output
+        )
         self.muon_warm_spectral_cap_mode = muon_warm_spectral_cap_mode
         self.muon_warm_power_steps = int(muon_warm_power_steps)
         self.muon_warm_power_safety_factor = float(
             muon_warm_power_safety_factor
         )
         self._next_muon_anchor_offset = 0
+        self._muon_warm_pending_drift_checks = {}
         if self.muon_warm_lr < 0.0:
             raise ValueError("muon_warm_lr must be non-negative")
         if self.muon_warm_max_tracking_error < 0.0:
@@ -1053,12 +1661,51 @@ class MuonWarm(torch.optim.Optimizer):
             raise ValueError("muon_warm_normal_scale must be non-negative")
         if self.muon_warm_normal_inv_cap < 0.0:
             raise ValueError("muon_warm_normal_inv_cap must be non-negative")
+        if self.muon_warm_normal_inv_ema_ratio < 0.0:
+            raise ValueError(
+                "muon_warm_normal_inv_ema_ratio must be non-negative"
+            )
+        if not 0.0 <= self.muon_warm_normal_inv_ema_beta < 1.0:
+            raise ValueError(
+                "muon_warm_normal_inv_ema_beta must be in [0, 1)"
+            )
+        if (
+            self.muon_warm_normal_inv_ema_ratio > 0.0
+            and self.muon_warm_normal_inv_cap <= 0.0
+        ):
+            raise ValueError(
+                "muon_warm_normal_inv_ema_ratio requires a positive "
+                "muon_warm_normal_inv_cap safety ceiling"
+            )
         if self.muon_warm_max_angular_rms < 0.0:
             raise ValueError("muon_warm_max_angular_rms must be non-negative")
+        if self.muon_warm_max_skew_ratio < 0.0:
+            raise ValueError("muon_warm_max_skew_ratio must be non-negative")
+        if (
+            self.muon_warm_max_angular_rms > 0.0
+            and self.muon_warm_max_skew_ratio > 0.0
+        ):
+            raise ValueError(
+                "muon_warm_max_angular_rms and muon_warm_max_skew_ratio "
+                "are mutually exclusive"
+            )
         if self.muon_warm_update_stats_every < 0:
             raise ValueError("muon_warm_update_stats_every must be non-negative")
         if self.muon_warm_reference_lr_ratio < 0.0:
             raise ValueError("muon_warm_reference_lr_ratio must be non-negative")
+        if self.muon_warm_output_scale < 0.0:
+            raise ValueError("muon_warm_output_scale must be non-negative")
+        if (
+            self.muon_warm_output_scale_start is not None
+            and self.muon_warm_output_scale_start < 0.0
+        ):
+            raise ValueError(
+                "muon_warm_output_scale_start must be non-negative"
+            )
+        if self.muon_warm_output_scale_decay < 0.0:
+            raise ValueError(
+                "muon_warm_output_scale_decay must be non-negative"
+            )
         if self.muon_warm_spectral_cap_mode not in (
             "gershgorin",
             "power",
@@ -1068,6 +1715,14 @@ class MuonWarm(torch.optim.Optimizer):
                 "muon_warm_spectral_cap_mode must be 'gershgorin', 'power', "
                 "or 'power_step'"
             )
+        if (
+            self.muon_warm_legacy_retraction_output
+            and self.muon_warm_spectral_cap_mode != "power_step"
+        ):
+            raise ValueError(
+                "muon_warm_legacy_retraction_output requires the "
+                "'power_step' spectral cap mode"
+            )
         if self.muon_warm_power_steps < 1:
             raise ValueError("muon_warm_power_steps must be >= 1")
         if self.muon_warm_power_safety_factor < 1.0:
@@ -1076,11 +1731,36 @@ class MuonWarm(torch.optim.Optimizer):
             )
         if (
             self.muon_warm_max_angular_rms > 0.0
+            and self.muon_warm_spectral_cap_mode
+            not in ("gershgorin", "power_step")
+        ):
+            raise ValueError(
+                "muon_warm_max_angular_rms requires the 'gershgorin' or "
+                "'power_step' spectral cap mode"
+            )
+        if (
+            self.muon_warm_max_skew_ratio > 0.0
+            and self.muon_warm_spectral_cap_mode != "power_step"
+        ):
+            raise ValueError(
+                "muon_warm_max_skew_ratio requires the 'power_step' "
+                "spectral cap mode"
+            )
+        if (
+            self.muon_warm_normal_inv_ema_ratio > 0.0
             and self.muon_warm_spectral_cap_mode != "gershgorin"
         ):
             raise ValueError(
-                "muon_warm_max_angular_rms currently requires the "
+                "muon_warm_normal_inv_ema_ratio currently requires the "
                 "'gershgorin' spectral cap mode"
+            )
+        if (
+            self.muon_warm_normal_inv_ema_ratio > 0.0
+            and self.muon_warm_max_angular_rms > 0.0
+        ):
+            raise ValueError(
+                "muon_warm_normal_inv_ema_ratio cannot currently be combined "
+                "with muon_warm_max_angular_rms"
             )
         
         # Convert params to param_groups if needed
@@ -1144,24 +1824,29 @@ class MuonWarm(torch.optim.Optimizer):
         cap_scale,
         probe_sigma=None,
         step_scale=None,
+        record_adjusted=True,
     ):
         state["muon_warm_power_vector"] = power_vector
-        state["muon_warm_power_sigma_tensor"] = power_sigma
-        state["muon_warm_spectral_cap_scale_tensor"] = cap_scale
-        state["muon_warm_power_sigma_sum_tensor"] = state.get(
-            "muon_warm_power_sigma_sum_tensor", torch.zeros_like(power_sigma)
-        ) + power_sigma
-        state["muon_warm_spectral_cap_scale_sum_tensor"] = state.get(
-            "muon_warm_spectral_cap_scale_sum_tensor",
-            torch.zeros_like(cap_scale),
-        ) + cap_scale
-        state["muon_warm_spectral_cap_min_scale_tensor"] = torch.minimum(
-            state.get("muon_warm_spectral_cap_min_scale_tensor", cap_scale),
-            cap_scale,
-        )
-        state["muon_warm_power_cap_samples"] = int(
-            state.get("muon_warm_power_cap_samples", 0)
-        ) + 1
+        if record_adjusted:
+            state["muon_warm_power_sigma_tensor"] = power_sigma
+            state["muon_warm_spectral_cap_scale_tensor"] = cap_scale
+            state["muon_warm_power_sigma_sum_tensor"] = state.get(
+                "muon_warm_power_sigma_sum_tensor",
+                torch.zeros_like(power_sigma),
+            ) + power_sigma
+            state["muon_warm_spectral_cap_scale_sum_tensor"] = state.get(
+                "muon_warm_spectral_cap_scale_sum_tensor",
+                torch.zeros_like(cap_scale),
+            ) + cap_scale
+            state["muon_warm_spectral_cap_min_scale_tensor"] = torch.minimum(
+                state.get(
+                    "muon_warm_spectral_cap_min_scale_tensor", cap_scale
+                ),
+                cap_scale,
+            )
+            state["muon_warm_power_cap_samples"] = int(
+                state.get("muon_warm_power_cap_samples", 0)
+            ) + 1
         if probe_sigma is not None and step_scale is not None:
             state["muon_warm_power_probe_sigma_tensor"] = probe_sigma
             state["muon_warm_spectral_step_scale_tensor"] = step_scale
@@ -1183,8 +1868,129 @@ class MuonWarm(torch.optim.Optimizer):
                 state.get("muon_warm_power_step_samples", 0)
             ) + 1
 
+    def _normal_inv_dynamic_cap(self, state):
+        if self.muon_warm_normal_inv_ema_ratio <= 0.0:
+            return None
+        ema_square = state.get("muon_warm_normal_inv_ema_sq_tensor")
+        if ema_square is None:
+            return None
+        return float(self.muon_warm_normal_inv_ema_ratio) * ema_square.sqrt()
+
+    def _record_normal_inv_ema_state(
+        self,
+        state,
+        observation_rms,
+        dynamic_cap,
+    ):
+        observation_square = observation_rms.square()
+        ema_square = state.get("muon_warm_normal_inv_ema_sq_tensor")
+        if ema_square is None:
+            ema_square = observation_square
+        else:
+            ema_square = ema_square.lerp(
+                observation_square,
+                1.0 - self.muon_warm_normal_inv_ema_beta,
+            )
+        state["muon_warm_normal_inv_ema_sq_tensor"] = ema_square
+        state["muon_warm_normal_inv_observation_sum_tensor"] = state.get(
+            "muon_warm_normal_inv_observation_sum_tensor",
+            torch.zeros_like(observation_rms),
+        ) + observation_rms
+        state["muon_warm_normal_inv_ema_samples"] = int(
+            state.get("muon_warm_normal_inv_ema_samples", 0)
+        ) + 1
+        if dynamic_cap is not None:
+            state["muon_warm_normal_inv_dynamic_cap_tensor"] = dynamic_cap
+            state["muon_warm_normal_inv_dynamic_cap_sum_tensor"] = state.get(
+                "muon_warm_normal_inv_dynamic_cap_sum_tensor",
+                torch.zeros_like(dynamic_cap),
+            ) + dynamic_cap
+            state["muon_warm_normal_inv_dynamic_cap_min_tensor"] = torch.minimum(
+                state.get(
+                    "muon_warm_normal_inv_dynamic_cap_min_tensor",
+                    dynamic_cap,
+                ),
+                dynamic_cap,
+            )
+            state["muon_warm_normal_inv_dynamic_cap_samples"] = int(
+                state.get("muon_warm_normal_inv_dynamic_cap_samples", 0)
+            ) + 1
+            fixed_cap = dynamic_cap.new_tensor(self.muon_warm_normal_inv_cap)
+            effective_cap = torch.minimum(fixed_cap, dynamic_cap)
+            active = (dynamic_cap < fixed_cap).to(torch.float32)
+            state["muon_warm_normal_inv_effective_cap_sum_tensor"] = state.get(
+                "muon_warm_normal_inv_effective_cap_sum_tensor",
+                torch.zeros_like(effective_cap),
+            ) + effective_cap
+            state["muon_warm_normal_inv_ema_active_sum_tensor"] = state.get(
+                "muon_warm_normal_inv_ema_active_sum_tensor",
+                torch.zeros_like(active),
+            ) + active
+
+    @staticmethod
+    def _apply_drift_check_results(
+        entries,
+        triggers,
+        flag_key,
+        checks_key,
+        asynchronous: bool,
+    ):
+        for (state, captured_anchor_serial), trigger in zip(entries, triggers):
+            state[checks_key] = int(state.get(checks_key, 0)) + 1
+            if int(state.get("muon_warm_anchor_serial", 0)) != int(
+                captured_anchor_serial
+            ):
+                state["muon_warm_async_stale_checks"] = int(
+                    state.get("muon_warm_async_stale_checks", 0)
+                ) + 1
+                continue
+            state[flag_key] = bool(trigger)
+            if asynchronous:
+                state["muon_warm_async_checks_completed"] = int(
+                    state.get("muon_warm_async_checks_completed", 0)
+                ) + 1
+
+    def _drain_pending_drift_checks(self):
+        pending_checks = getattr(
+            self, "_muon_warm_pending_drift_checks", {}
+        )
+        reusable_buffers = getattr(
+            self, "_muon_warm_drift_host_buffers", {}
+        )
+        for device, pending in tuple(pending_checks.items()):
+            if not pending["event"].query():
+                continue
+            triggers = (
+                pending["host_signals"] > float(pending["threshold"])
+            ).tolist()
+            self._apply_drift_check_results(
+                pending["entries"],
+                triggers,
+                pending["flag_key"],
+                pending["checks_key"],
+                True,
+            )
+            reusable_buffers[device] = pending["host_signals"]
+            del pending_checks[device]
+        self._muon_warm_pending_drift_checks = pending_checks
+        self._muon_warm_drift_host_buffers = reusable_buffers
+
     def _prepare_angular_anchor_flags(self):
-        if self.muon_warm_max_angular_rms <= 0.0:
+        # Poll before gathering a new check. Event.query() never waits for CUDA;
+        # a completed copy therefore turns into an anchor flag one or more
+        # optimizer steps after it was submitted.
+        self._drain_pending_drift_checks()
+        if self.muon_warm_max_skew_ratio > 0.0:
+            threshold = self.muon_warm_max_skew_ratio
+            signal_key = "muon_warm_skew_ratio_signal_tensor"
+            flag_key = "muon_warm_force_skew_ratio_anchor"
+            checks_key = "muon_warm_skew_ratio_checks"
+        elif self.muon_warm_max_angular_rms > 0.0:
+            threshold = self.muon_warm_max_angular_rms
+            signal_key = "muon_warm_angular_signal_tensor"
+            flag_key = "muon_warm_force_angular_anchor"
+            checks_key = "muon_warm_angular_checks"
+        else:
             return
         by_device = {}
         for group in self.param_groups:
@@ -1197,20 +2003,69 @@ class MuonWarm(torch.optim.Optimizer):
                 next_step = int(state.get("step", 0)) + 1
                 if next_step % self.muon_warm_check_every != 0:
                     continue
-                signal = state.get("muon_warm_angular_signal_tensor")
+                signal = state.get(signal_key)
                 if signal is None:
                     continue
                 by_device.setdefault(signal.device, []).append((state, signal))
         for entries in by_device.values():
+            device = entries[0][1].device
+            pending_checks = self._muon_warm_pending_drift_checks
+            if (
+                self.muon_warm_async_checks
+                and device.type == "cuda"
+                and device in pending_checks
+            ):
+                for state, _ in entries:
+                    state["muon_warm_async_enqueue_skips"] = int(
+                        state.get("muon_warm_async_enqueue_skips", 0)
+                    ) + 1
+                continue
             signals = torch.stack([signal for _, signal in entries])
-            triggers = (
-                signals > float(self.muon_warm_max_angular_rms)
-            ).tolist()
-            for (state, _), trigger in zip(entries, triggers):
-                state["muon_warm_force_angular_anchor"] = bool(trigger)
-                state["muon_warm_angular_checks"] = int(
-                    state.get("muon_warm_angular_checks", 0)
-                ) + 1
+            result_entries = [
+                (state, int(state.get("muon_warm_anchor_serial", 0)))
+                for state, _ in entries
+            ]
+            if self.muon_warm_async_checks and signals.device.type == "cuda":
+                reusable_buffers = getattr(
+                    self, "_muon_warm_drift_host_buffers", {}
+                )
+                host_signals = reusable_buffers.pop(device, None)
+                if (
+                    host_signals is None
+                    or host_signals.shape != signals.shape
+                    or host_signals.dtype != signals.dtype
+                ):
+                    host_signals = torch.empty(
+                        signals.shape,
+                        dtype=signals.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                host_signals.copy_(signals, non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(device))
+                pending_checks[device] = {
+                    "entries": result_entries,
+                    "host_signals": host_signals,
+                    "event": event,
+                    "threshold": float(threshold),
+                    "flag_key": flag_key,
+                    "checks_key": checks_key,
+                }
+                self._muon_warm_drift_host_buffers = reusable_buffers
+                for state, _ in entries:
+                    state["muon_warm_async_checks_submitted"] = int(
+                        state.get("muon_warm_async_checks_submitted", 0)
+                    ) + 1
+            else:
+                triggers = (signals > float(threshold)).tolist()
+                self._apply_drift_check_results(
+                    result_entries,
+                    triggers,
+                    flag_key,
+                    checks_key,
+                    False,
+                )
 
     def _compute_warm_direction(
         self,
@@ -1220,6 +2075,9 @@ class MuonWarm(torch.optim.Optimizer):
         state,
         transposed,
     ):
+        state["muon_warm_did_output_retract"] = bool(
+            self.muon_warm_legacy_retraction_output
+        )
         warm_index = int(state.get("muon_warm_age", 0)) + 1
         retract_now = warm_index % self.muon_warm_retract_every == 0
         retract_steps = (
@@ -1243,6 +2101,7 @@ class MuonWarm(torch.optim.Optimizer):
         )
         power_step_mode = self.muon_warm_spectral_cap_mode == "power_step"
         power_vector = state.get("muon_warm_power_vector")
+        dynamic_normal_inv_cap = self._normal_inv_dynamic_cap(state)
         if (
             self.muon_warm_max_tangent_rms <= 0.0
             and self.muon_warm_alignment_tolerance < 0.0
@@ -1252,22 +2111,113 @@ class MuonWarm(torch.optim.Optimizer):
         ):
             if power_mode:
                 if power_step_mode:
-                    (
-                        q_next,
-                        power_vector,
-                        power_sigma,
-                        cap_scale,
-                        probe_sigma,
-                        step_scale,
-                    ) = _warm_polar_jacobi_step_power_step_cap(
-                        *arguments,
-                        power_vector,
-                        self.muon_warm_power_steps,
-                        self.muon_warm_power_safety_factor,
-                        self.muon_warm_angular_scale,
-                        self.muon_warm_normal_scale,
-                        self.muon_warm_normal_inv_cap,
-                    )
+                    if self.muon_warm_max_skew_ratio > 0.0:
+                        skew_ratio_step = (
+                            _warm_polar_jacobi_step_power_step_cap_with_skew_ratio_signal
+                            if retract_steps > 0
+                            else _warm_polar_jacobi_step_power_step_cap_with_skew_ratio_signal_no_cache_retract
+                        )
+                        (
+                            q_next,
+                            output_direction,
+                            skew_ratio_signal,
+                            power_vector,
+                            power_sigma,
+                            cap_scale,
+                            probe_sigma,
+                            step_scale,
+                        ) = skew_ratio_step(
+                            *arguments,
+                            power_vector,
+                            self.muon_warm_power_steps,
+                            self.muon_warm_power_safety_factor,
+                            self.muon_warm_legacy_retraction_output,
+                            self.muon_warm_angular_scale,
+                            self.muon_warm_normal_scale,
+                            self.muon_warm_normal_inv_cap,
+                        )
+                        state["muon_warm_skew_ratio_signal_tensor"] = (
+                            skew_ratio_signal
+                        )
+                        if self.muon_warm_legacy_retraction_output:
+                            state["muon_warm_legacy_output_direction"] = (
+                                output_direction
+                            )
+                    elif self.muon_warm_max_angular_rms > 0.0:
+                        angular_step = (
+                            _warm_polar_jacobi_step_power_step_cap_with_angular_signal
+                            if retract_steps > 0
+                            else _warm_polar_jacobi_step_power_step_cap_with_angular_signal_no_cache_retract
+                        )
+                        (
+                            q_next,
+                            output_direction,
+                            angular_signal,
+                            power_vector,
+                            power_sigma,
+                            cap_scale,
+                            probe_sigma,
+                            step_scale,
+                        ) = angular_step(
+                            *arguments,
+                            power_vector,
+                            self.muon_warm_power_steps,
+                            self.muon_warm_power_safety_factor,
+                            self.muon_warm_legacy_retraction_output,
+                            self.muon_warm_angular_scale,
+                            self.muon_warm_normal_scale,
+                            self.muon_warm_normal_inv_cap,
+                        )
+                        state["muon_warm_angular_signal_tensor"] = (
+                            angular_signal
+                        )
+                        if self.muon_warm_legacy_retraction_output:
+                            state["muon_warm_legacy_output_direction"] = (
+                                output_direction
+                            )
+                    elif self.muon_warm_legacy_retraction_output:
+                        legacy_step = (
+                            _warm_polar_jacobi_step_power_step_cap_with_legacy_output
+                            if retract_steps > 0
+                            else _warm_polar_jacobi_step_power_step_cap_with_legacy_output_no_cache_retract
+                        )
+                        (
+                            q_next,
+                            output_direction,
+                            power_vector,
+                            power_sigma,
+                            cap_scale,
+                            probe_sigma,
+                            step_scale,
+                        ) = legacy_step(
+                            *arguments,
+                            power_vector,
+                            self.muon_warm_power_steps,
+                            self.muon_warm_power_safety_factor,
+                            self.muon_warm_angular_scale,
+                            self.muon_warm_normal_scale,
+                            self.muon_warm_normal_inv_cap,
+                        )
+                        state["muon_warm_legacy_output_direction"] = (
+                            output_direction
+                        )
+                    else:
+                        (
+                            q_next,
+                            power_vector,
+                            power_sigma,
+                            cap_scale,
+                            probe_sigma,
+                            step_scale,
+                        ) = _warm_polar_jacobi_step_power_step_cap(
+                            *arguments,
+                            power_vector,
+                            self.muon_warm_power_steps,
+                            self.muon_warm_power_safety_factor,
+                            self.muon_warm_angular_scale,
+                            self.muon_warm_normal_scale,
+                            self.muon_warm_normal_inv_cap,
+                        )
                 else:
                     q_next, power_vector, power_sigma, cap_scale = (
                         _warm_polar_jacobi_step_power_cap(
@@ -1288,7 +2238,25 @@ class MuonWarm(torch.optim.Optimizer):
                     cap_scale,
                     probe_sigma,
                     step_scale,
+                    retract_steps > 0,
                 )
+                return q_next
+            if self.muon_warm_normal_inv_ema_ratio > 0.0:
+                q_next, normal_inv_observation_rms = (
+                    _warm_polar_jacobi_step_with_normal_inv_observation(
+                        *arguments,
+                        self.muon_warm_angular_scale,
+                        self.muon_warm_normal_scale,
+                        self.muon_warm_normal_inv_cap,
+                        dynamic_normal_inv_cap,
+                    )
+                )
+                if tracking_matrix.shape[-1] > tracking_matrix.shape[-2]:
+                    self._record_normal_inv_ema_state(
+                        state,
+                        normal_inv_observation_rms,
+                        dynamic_normal_inv_cap,
+                    )
                 return q_next
             if self.muon_warm_max_angular_rms > 0.0:
                 q_next, angular_signal = (
@@ -1319,26 +2287,57 @@ class MuonWarm(torch.optim.Optimizer):
             )
         if power_mode:
             if power_step_mode:
-                (
-                    q_next,
-                    stats,
-                    power_vector,
-                    power_sigma,
-                    cap_scale,
-                    probe_sigma,
-                    step_scale,
-                ) = _warm_polar_jacobi_step_power_step_cap_with_stats(
-                    *arguments,
-                    self.muon_warm_max_tangent_rms,
-                    self.muon_warm_alignment_tolerance,
-                    dynamic_tangent_cap,
-                    power_vector,
-                    self.muon_warm_power_steps,
-                    self.muon_warm_power_safety_factor,
-                    self.muon_warm_angular_scale,
-                    self.muon_warm_normal_scale,
-                    self.muon_warm_normal_inv_cap,
-                )
+                if self.muon_warm_legacy_retraction_output:
+                    legacy_step_with_stats = (
+                        _warm_polar_jacobi_step_power_step_cap_with_stats_and_legacy_output
+                        if retract_steps > 0
+                        else _warm_polar_jacobi_step_power_step_cap_with_stats_and_legacy_output_no_cache_retract
+                    )
+                    (
+                        q_next,
+                        output_direction,
+                        stats,
+                        power_vector,
+                        power_sigma,
+                        cap_scale,
+                        probe_sigma,
+                        step_scale,
+                    ) = legacy_step_with_stats(
+                        *arguments,
+                        self.muon_warm_max_tangent_rms,
+                        self.muon_warm_alignment_tolerance,
+                        dynamic_tangent_cap,
+                        power_vector,
+                        self.muon_warm_power_steps,
+                        self.muon_warm_power_safety_factor,
+                        self.muon_warm_angular_scale,
+                        self.muon_warm_normal_scale,
+                        self.muon_warm_normal_inv_cap,
+                    )
+                    state["muon_warm_legacy_output_direction"] = (
+                        output_direction
+                    )
+                else:
+                    (
+                        q_next,
+                        stats,
+                        power_vector,
+                        power_sigma,
+                        cap_scale,
+                        probe_sigma,
+                        step_scale,
+                    ) = _warm_polar_jacobi_step_power_step_cap_with_stats(
+                        *arguments,
+                        self.muon_warm_max_tangent_rms,
+                        self.muon_warm_alignment_tolerance,
+                        dynamic_tangent_cap,
+                        power_vector,
+                        self.muon_warm_power_steps,
+                        self.muon_warm_power_safety_factor,
+                        self.muon_warm_angular_scale,
+                        self.muon_warm_normal_scale,
+                        self.muon_warm_normal_inv_cap,
+                    )
             else:
                 q_next, stats, power_vector, power_sigma, cap_scale = (
                     _warm_polar_jacobi_step_power_cap_with_stats(
@@ -1362,6 +2361,7 @@ class MuonWarm(torch.optim.Optimizer):
                 cap_scale,
                 probe_sigma,
                 step_scale,
+                retract_steps > 0,
             )
         else:
             q_next, stats = _warm_polar_jacobi_step_with_stats(
@@ -1372,6 +2372,7 @@ class MuonWarm(torch.optim.Optimizer):
                 self.muon_warm_angular_scale,
                 self.muon_warm_normal_scale,
                 self.muon_warm_normal_inv_cap,
+                dynamic_normal_inv_cap,
             )
         state["muon_warm_effective_eta_tensor"] = stats[0]
         state["muon_warm_tangent_rms_tensor"] = stats[1]
@@ -1381,8 +2382,12 @@ class MuonWarm(torch.optim.Optimizer):
         state["muon_warm_relative_min_abs_diag_tensor"] = stats[5]
         state["muon_warm_relative_max_abs_inv_tensor"] = stats[6]
         state["muon_warm_normal_inv_clipped_fraction_tensor"] = stats[7]
+        state["muon_warm_normal_inv_observation_rms_tensor"] = stats[8]
+        state["muon_warm_skew_ratio_tensor"] = stats[9]
         if self.muon_warm_max_angular_rms > 0.0:
             state["muon_warm_angular_signal_tensor"] = stats[3]
+        if self.muon_warm_max_skew_ratio > 0.0:
+            state["muon_warm_skew_ratio_signal_tensor"] = stats[9]
         state["muon_warm_controller_samples"] = int(
             state.get("muon_warm_controller_samples", 0)
         ) + 1
@@ -1391,6 +2396,7 @@ class MuonWarm(torch.optim.Optimizer):
             ("tangent_rms", stats[1]),
             ("angular_rms", stats[3]),
             ("normal_rms", stats[4]),
+            ("skew_ratio", stats[9]),
         ):
             sum_key = f"muon_warm_{name}_sum_tensor"
             max_key = f"muon_warm_{name}_max_tensor"
@@ -1404,6 +2410,7 @@ class MuonWarm(torch.optim.Optimizer):
                 ("relative_min_abs_diag", stats[5]),
                 ("relative_max_abs_inv", stats[6]),
                 ("normal_inv_clipped_fraction", stats[7]),
+                ("normal_inv_observation_rms", stats[8]),
             ):
                 sum_key = f"muon_warm_{name}_sum_tensor"
                 state[sum_key] = (
@@ -1421,6 +2428,12 @@ class MuonWarm(torch.optim.Optimizer):
                 ),
                 stats[6],
             )
+            if self.muon_warm_normal_inv_ema_ratio > 0.0:
+                self._record_normal_inv_ema_state(
+                    state,
+                    stats[8],
+                    dynamic_normal_inv_cap,
+                )
         applied_rms = stats[0] * stats[1]
         state["muon_warm_max_tangent_rms_tensor"] = torch.maximum(
             state.get("muon_warm_max_tangent_rms_tensor", stats[1]),
@@ -1452,6 +2465,8 @@ class MuonWarm(torch.optim.Optimizer):
         return q_next
 
     def _muon_update_warm(self, grad, state, group):
+        state.pop("muon_warm_legacy_output_direction", None)
+        state["muon_warm_did_output_retract"] = False
         record_update = (
             self.muon_warm_update_stats_every > 0
             and state["step"] % self.muon_warm_update_stats_every == 0
@@ -1489,6 +2504,9 @@ class MuonWarm(torch.optim.Optimizer):
         force_angular_anchor = bool(
             state.pop("muon_warm_force_angular_anchor", False)
         )
+        force_skew_ratio_anchor = bool(
+            state.pop("muon_warm_force_skew_ratio_anchor", False)
+        )
         if q_prev is None:
             anchor_reason = "initial"
         elif (
@@ -1513,6 +2531,8 @@ class MuonWarm(torch.optim.Optimizer):
             anchor_reason = "max_age"
         elif force_angular_anchor:
             anchor_reason = "angular_rms"
+        elif force_skew_ratio_anchor:
+            anchor_reason = "skew_ratio"
         needs_anchor = anchor_reason is not None
         tracking_matrix = (
             work_matrix
@@ -1581,6 +2601,9 @@ class MuonWarm(torch.optim.Optimizer):
                 anchor_reason = "stretch"
             needs_anchor = anchor_reason is not None
         if needs_anchor:
+            state["muon_warm_anchor_serial"] = int(
+                state.get("muon_warm_anchor_serial", 0)
+            ) + 1
             q_next = self._compute_anchor_direction(
                 work_matrix,
                 state,
@@ -1594,6 +2617,7 @@ class MuonWarm(torch.optim.Optimizer):
             )
             state.pop("muon_warm_power_vector", None)
             state.pop("muon_warm_angular_signal_tensor", None)
+            state.pop("muon_warm_skew_ratio_signal_tensor", None)
         else:
             q_next = self._compute_warm_direction(
                 tracking_matrix,
@@ -1626,6 +2650,10 @@ class MuonWarm(torch.optim.Optimizer):
                 state["muon_warm_warm_retractions"] = int(
                     state.get("muon_warm_warm_retractions", 0)
                 ) + 1
+            if state.get("muon_warm_did_output_retract", False):
+                state["muon_warm_output_retractions"] = int(
+                    state.get("muon_warm_output_retractions", 0)
+                ) + 1
             if self.muon_warm_alignment_tolerance >= 0.0:
                 rejected = 1.0 - state["muon_warm_step_accepted_tensor"]
                 previous_rejections = state.get(
@@ -1639,12 +2667,27 @@ class MuonWarm(torch.optim.Optimizer):
             0 if needs_anchor else int(state.get("muon_warm_age", 0)) + 1
         )
         state["muon_warm_q"] = q_next.contiguous()
+        output_direction = state.pop(
+            "muon_warm_legacy_output_direction",
+            q_next,
+        )
+        warm_output_scale = 1.0
+        if not needs_anchor:
+            warm_output_scale = self.muon_warm_output_scale
+            if self.muon_warm_output_scale_start is not None:
+                warm_output_scale = self.muon_warm_output_scale + (
+                    self.muon_warm_output_scale_start
+                    - self.muon_warm_output_scale
+                ) * math.exp(
+                    -self.muon_warm_output_scale_decay
+                    * max(0, int(state["muon_warm_age"]) - 1)
+                )
 
         if record_update:
             # Accumulate scalar tensors on device and transfer them only when
             # diagnostics are requested after training.  The reference solve is
             # deliberately opt-in because it performs the full anchor work.
-            q_float = q_next.float()
+            q_float = output_direction.float()
             matrix_float = work_matrix.float()
             aspect_scale = max(
                 1.0,
@@ -1656,6 +2699,7 @@ class MuonWarm(torch.optim.Optimizer):
                 measurement_scale = float(target_norm) / (
                     q_float.norm().clamp_min(1e-12)
                 )
+            measurement_scale = measurement_scale * warm_output_scale
             direction_sq = q_float.square().sum() * measurement_scale**2
             momentum_sq = matrix_float.square().sum()
             direction_momentum_dot = (
@@ -1835,7 +2879,7 @@ class MuonWarm(torch.optim.Optimizer):
                             value,
                         )
 
-        update = _restore_muon_matrix(q_next, transposed)
+        update = _restore_muon_matrix(output_direction, transposed)
         # Keep aspect-ratio scaling out of place.  `_restore_muon_matrix` may
         # return the same storage as the cached q_next, depending on layout.
         update = update * max(1, update.size(-2) / update.size(-1)) ** 0.5
@@ -1847,6 +2891,11 @@ class MuonWarm(torch.optim.Optimizer):
             target_norm = math.sqrt(max(1, matrix_shape[-2]))
             output_scale = target_norm / update.float().norm().clamp_min(1e-12)
             update = update * output_scale.to(update.dtype)
+        if warm_output_scale != 1.0:
+            # Filter only the direction returned to the parameter update.  The
+            # cached q_next above remains an unscaled transport iterate, so the
+            # next warm step starts from the same geometry as the control.
+            update = update * warm_output_scale
         return update.reshape(original_shape) if update.shape != original_shape else update
 
     @torch.no_grad()

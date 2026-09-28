@@ -31,6 +31,7 @@ def test_local_optimizer_is_the_default():
     assert args.muon_spectral_cap_mode == "gershgorin"
     assert args.muon_power_steps == 2
     assert args.muon_power_safety_factor == 1.25
+    assert not args.muon_async_checks
     assert not args.hf_streaming
 
 
@@ -94,6 +95,7 @@ def test_optimizer_diagnostics_summarizes_muon_reference_statistics():
             "muon_reference_elements": 4,
             "muon_reference_samples": 1,
             "muon_warm_q": torch.eye(2),
+            "muon_warm_output_retractions": 7,
             "muon_warm_power_cap_samples": 2,
             "muon_warm_power_sigma_sum_tensor": torch.tensor(2.2),
             "muon_warm_spectral_cap_scale_sum_tensor": torch.tensor(1.8),
@@ -168,3 +170,26 @@ def test_optimizer_diagnostics_summarizes_muon_reference_statistics():
     assert diagnostics["power_cap_stats"]["mean_probe_top_singular"] == 2.0
     assert diagnostics["power_cap_stats"]["mean_transport_step_scale"] == pytest.approx(0.3)
     assert diagnostics["power_cap_stats"]["minimum_transport_step_scale"] == pytest.approx(0.2)
+    assert diagnostics["output_retractions"] == 7
+
+
+def test_optimizer_diagnostics_reports_step_only_power_statistics():
+    parameter = torch.nn.Parameter(torch.zeros(2, 2))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    optimizer.state[parameter].update(
+        {
+            "muon_warm_power_step_samples": 2,
+            "muon_warm_power_probe_sigma_sum_tensor": torch.tensor(4.0),
+            "muon_warm_spectral_step_scale_sum_tensor": torch.tensor(0.6),
+            "muon_warm_spectral_step_min_scale_tensor": torch.tensor(0.2),
+        }
+    )
+
+    diagnostics = optimizer_diagnostics(optimizer)
+
+    assert diagnostics["power_cap_stats"] == {
+        "step_samples": 2,
+        "mean_probe_top_singular": 2.0,
+        "mean_transport_step_scale": pytest.approx(0.3),
+        "minimum_transport_step_scale": pytest.approx(0.2),
+    }

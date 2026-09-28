@@ -446,7 +446,11 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace, device: torch.de
             muon_warm_max_tangent_rms=args.muon_max_tangent_rms,
             muon_warm_record_stats=args.muon_record_stats,
             muon_warm_normal_inv_cap=args.muon_normal_inv_cap,
+            muon_warm_normal_inv_ema_ratio=args.muon_normal_inv_ema_ratio,
+            muon_warm_normal_inv_ema_beta=args.muon_normal_inv_ema_beta,
             muon_warm_max_angular_rms=args.muon_max_angular_rms,
+            muon_warm_max_skew_ratio=args.muon_max_skew_ratio,
+            muon_warm_async_checks=args.muon_async_checks,
             muon_warm_update_stats_every=args.muon_update_stats_every,
             muon_warm_reference_lr_ratio=(
                 args.muon_reference_lr / args.muon_lr
@@ -454,6 +458,10 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace, device: torch.de
                 else 1.0
             ),
             muon_warm_normalize_output=args.muon_normalize_output,
+            muon_warm_output_scale=args.muon_output_scale,
+            muon_warm_output_scale_start=args.muon_output_scale_start,
+            muon_warm_output_scale_decay=args.muon_output_scale_decay,
+            muon_warm_legacy_retraction_output=args.muon_legacy_retraction_output,
             muon_warm_spectral_cap_mode=args.muon_spectral_cap_mode,
             muon_warm_power_steps=args.muon_power_steps,
             muon_warm_power_safety_factor=args.muon_power_safety_factor,
@@ -498,7 +506,11 @@ def _tree_tensor_bytes(value: Any, seen: set[int]) -> int:
 def optimizer_diagnostics(optimizer) -> dict[str, Any]:
     anchors = Counter()
     angular_checks = 0
-    warm_steps = warm_retractions = basis_refreshes = active_factors = 0
+    skew_ratio_checks = 0
+    async_checks_submitted = async_checks_completed = 0
+    async_enqueue_skips = async_stale_checks = 0
+    warm_steps = warm_retractions = output_retractions = 0
+    basis_refreshes = active_factors = 0
     hard_reset_events = hard_reset_factors = 0
     reset_first_refreshes: list[int] = []
     seen: set[int] = set()
@@ -517,6 +529,10 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
     alignment_condition_sums: dict[str, float] = Counter()
     relative_min_abs_diag = math.inf
     relative_max_abs_inv = 0.0
+    normal_inv_ema_samples = normal_inv_dynamic_cap_samples = 0
+    normal_inv_observation_sum = normal_inv_dynamic_cap_sum = 0.0
+    normal_inv_effective_cap_sum = normal_inv_ema_active_sum = 0.0
+    normal_inv_dynamic_cap_min = math.inf
     refresh_predictor_names = (
         "momentum_innovation_ratio",
         "tangent_rms",
@@ -553,8 +569,26 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
         state_bytes += _tree_tensor_bytes(state, seen)
         anchors.update(state.get("muon_warm_anchor_counts", {}))
         angular_checks += int(state.get("muon_warm_angular_checks", 0))
+        skew_ratio_checks += int(
+            state.get("muon_warm_skew_ratio_checks", 0)
+        )
+        async_checks_submitted += int(
+            state.get("muon_warm_async_checks_submitted", 0)
+        )
+        async_checks_completed += int(
+            state.get("muon_warm_async_checks_completed", 0)
+        )
+        async_enqueue_skips += int(
+            state.get("muon_warm_async_enqueue_skips", 0)
+        )
+        async_stale_checks += int(
+            state.get("muon_warm_async_stale_checks", 0)
+        )
         warm_steps += int(state.get("muon_warm_warm_steps", 0))
         warm_retractions += int(state.get("muon_warm_warm_retractions", 0))
+        output_retractions += int(
+            state.get("muon_warm_output_retractions", 0)
+        )
         basis_refreshes += int(state.get("basis_refreshes", 0))
         state_active_factors = sum(
             value is not None for value in state.get("Q", ())
@@ -608,6 +642,7 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
                 "tangent_rms",
                 "angular_rms",
                 "normal_rms",
+                "skew_ratio",
             ):
                 controller_sums[name] += float(
                     state[f"muon_warm_{name}_sum_tensor"]
@@ -636,6 +671,32 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
             relative_max_abs_inv = max(
                 relative_max_abs_inv,
                 float(state["muon_warm_relative_max_abs_inv_max_tensor"]),
+            )
+        state_normal_inv_ema_samples = int(
+            state.get("muon_warm_normal_inv_ema_samples", 0)
+        )
+        if state_normal_inv_ema_samples > 0:
+            normal_inv_ema_samples += state_normal_inv_ema_samples
+            normal_inv_observation_sum += float(
+                state["muon_warm_normal_inv_observation_sum_tensor"]
+            )
+        state_dynamic_cap_samples = int(
+            state.get("muon_warm_normal_inv_dynamic_cap_samples", 0)
+        )
+        if state_dynamic_cap_samples > 0:
+            normal_inv_dynamic_cap_samples += state_dynamic_cap_samples
+            normal_inv_dynamic_cap_sum += float(
+                state["muon_warm_normal_inv_dynamic_cap_sum_tensor"]
+            )
+            normal_inv_effective_cap_sum += float(
+                state["muon_warm_normal_inv_effective_cap_sum_tensor"]
+            )
+            normal_inv_ema_active_sum += float(
+                state["muon_warm_normal_inv_ema_active_sum_tensor"]
+            )
+            normal_inv_dynamic_cap_min = min(
+                normal_inv_dynamic_cap_min,
+                float(state["muon_warm_normal_inv_dynamic_cap_min_tensor"]),
             )
         for key in statistic_keys:
             value = state.get(key)
@@ -696,8 +757,16 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
         "state_megabytes": state_bytes / 2**20,
         "anchor_counts": dict(sorted(anchors.items())),
         "angular_checks": angular_checks,
+        "skew_ratio_checks": skew_ratio_checks,
+        "async_drift_checks": {
+            "submitted": async_checks_submitted,
+            "completed": async_checks_completed,
+            "enqueue_skips": async_enqueue_skips,
+            "stale_after_anchor": async_stale_checks,
+        },
         "warm_steps": warm_steps,
         "warm_retractions": warm_retractions,
+        "output_retractions": output_retractions,
         "basis_refreshes": basis_refreshes,
         "active_factors": active_factors,
         "hard_reset_events": hard_reset_events,
@@ -733,17 +802,23 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
                 "muon_update_max_orthogonality_error_tensor", 0.0
             ),
         }
-    if power_cap_samples > 0:
-        diagnostics["power_cap_stats"] = {
-            "samples": power_cap_samples,
-            "mean_estimated_top_singular": (
-                power_sigma_sum / power_cap_samples
-            ),
-            "mean_input_scale": power_cap_scale_sum / power_cap_samples,
-            "minimum_input_scale": power_cap_min_scale,
-        }
+    if power_cap_samples > 0 or power_step_samples > 0:
+        power_cap_stats = {}
+        if power_cap_samples > 0:
+            power_cap_stats.update(
+                {
+                    "samples": power_cap_samples,
+                    "mean_estimated_top_singular": (
+                        power_sigma_sum / power_cap_samples
+                    ),
+                    "mean_input_scale": (
+                        power_cap_scale_sum / power_cap_samples
+                    ),
+                    "minimum_input_scale": power_cap_min_scale,
+                }
+            )
         if power_step_samples > 0:
-            diagnostics["power_cap_stats"].update(
+            power_cap_stats.update(
                 {
                     "step_samples": power_step_samples,
                     "mean_probe_top_singular": (
@@ -755,6 +830,7 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
                     "minimum_transport_step_scale": power_step_min_scale,
                 }
             )
+        diagnostics["power_cap_stats"] = power_cap_stats
     if controller_samples > 0:
         diagnostics["transport_step_stats"] = {
             "samples": controller_samples,
@@ -773,6 +849,10 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
                 controller_sums["normal_rms"] / controller_samples
             ),
             "maximum_normal_rms": controller_maxima["normal_rms"],
+            "mean_skew_ratio": (
+                controller_sums["skew_ratio"] / controller_samples
+            ),
+            "maximum_skew_ratio": controller_maxima["skew_ratio"],
         }
     if alignment_condition_samples > 0:
         diagnostics["alignment_condition_stats"] = {
@@ -790,6 +870,31 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
             "mean_normal_inverse_clipped_fraction": (
                 alignment_condition_sums["normal_inv_clipped_fraction"]
                 / alignment_condition_samples
+            ),
+        }
+    if normal_inv_ema_samples > 0:
+        diagnostics["normal_inverse_ema_stats"] = {
+            "samples": normal_inv_ema_samples,
+            "mean_fixed_cap_inverse_rms": (
+                normal_inv_observation_sum / normal_inv_ema_samples
+            ),
+            "dynamic_cap_samples": normal_inv_dynamic_cap_samples,
+            "mean_dynamic_cap": (
+                normal_inv_dynamic_cap_sum
+                / max(1, normal_inv_dynamic_cap_samples)
+            ),
+            "mean_effective_cap": (
+                normal_inv_effective_cap_sum
+                / max(1, normal_inv_dynamic_cap_samples)
+            ),
+            "ema_active_fraction": (
+                normal_inv_ema_active_sum
+                / max(1, normal_inv_dynamic_cap_samples)
+            ),
+            "minimum_dynamic_cap": (
+                normal_inv_dynamic_cap_min
+                if normal_inv_dynamic_cap_samples > 0
+                else None
             ),
         }
     if reference_elements > 0:
@@ -1415,10 +1520,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--muon-max-tangent-rms", type=float, default=0.0)
     parser.add_argument("--muon-record-stats", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--muon-normal-inv-cap", type=float, default=0.0)
+    parser.add_argument("--muon-normal-inv-ema-ratio", type=float, default=0.0)
+    parser.add_argument("--muon-normal-inv-ema-beta", type=float, default=0.95)
     parser.add_argument("--muon-max-angular-rms", type=float, default=0.0)
+    parser.add_argument("--muon-max-skew-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--muon-async-checks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--muon-update-stats-every", type=int, default=0)
     parser.add_argument("--muon-reference-lr", type=float, default=0.0)
     parser.add_argument("--muon-normalize-output", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--muon-output-scale", type=float, default=1.0)
+    parser.add_argument("--muon-output-scale-start", type=float)
+    parser.add_argument("--muon-output-scale-decay", type=float, default=1.0)
+    parser.add_argument("--muon-legacy-retraction-output", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--muon-spectral-cap-mode", choices=("gershgorin", "power", "power_step"), default="gershgorin")
     parser.add_argument("--muon-power-steps", type=int, default=2)
     parser.add_argument("--muon-power-safety-factor", type=float, default=1.25)
