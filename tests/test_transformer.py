@@ -25,6 +25,41 @@ def test_explicit_feedforward_width_is_respected():
     assert feedforward.proj_in.out_features == 96
 
 
+def test_split_optimizer_topology_preserves_qkv_and_swiglu_boundaries():
+    model = Transformer(
+        dim=32,
+        depth=1,
+        heads=4,
+        ff_mult=2.0,
+        ff_hidden_dim=48,
+        vocab_size=64,
+        max_seq_len=16,
+        fused_qkv=False,
+        fused_swiglu=False,
+    )
+    attention = model.blocks[0].attn
+    feedforward = model.blocks[0].ff
+
+    assert attention.to_qkv is None
+    assert [
+        attention.to_q.weight.shape,
+        attention.to_k.weight.shape,
+        attention.to_v.weight.shape,
+    ] == [
+        torch.Size((32, 32)),
+        torch.Size((32, 32)),
+        torch.Size((32, 32)),
+    ]
+    assert feedforward.proj_in is None
+    assert feedforward.up_proj.weight.shape == (48, 32)
+    assert feedforward.gate_proj.weight.shape == (48, 32)
+
+    inputs = torch.randint(0, 64, (2, 16))
+    loss = model(inputs, inputs)
+    loss.backward()
+    assert loss.isfinite()
+
+
 def test_causal_forward_loss_and_backward_are_finite():
     torch.manual_seed(7)
     model = Transformer(

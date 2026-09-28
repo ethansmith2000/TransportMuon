@@ -35,6 +35,7 @@ class Attention(nn.Module):
         norm_eps: float = 1e-5,
         bias: bool = False,
         dropout: float = 0.0,
+        fused_qkv: bool = True,
     ) -> None:
         super().__init__()
         if dim % heads:
@@ -49,15 +50,32 @@ class Attention(nn.Module):
         self.rope_theta = float(rope_theta)
         self.max_seq_len = max_seq_len
         self.dropout = float(dropout)
+        self.fused_qkv = bool(fused_qkv)
         if self.use_rope and self.head_dim % 2:
             raise ValueError("RoPE requires an even head dimension")
 
-        self.to_qkv = nn.Linear(dim, 3 * dim, bias=bias)
+        if self.fused_qkv:
+            self.to_qkv = nn.Linear(dim, 3 * dim, bias=bias)
+            self.to_q = self.to_k = self.to_v = None
+        else:
+            self.to_qkv = None
+            self.to_q = nn.Linear(dim, dim, bias=bias)
+            self.to_k = nn.Linear(dim, dim, bias=bias)
+            self.to_v = nn.Linear(dim, dim, bias=bias)
         self.to_out = nn.Linear(dim, dim, bias=bias)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=norm_eps) if qk_norm else nn.Identity()
         self.k_norm = nn.RMSNorm(self.head_dim, eps=norm_eps) if qk_norm else nn.Identity()
-        self.register_buffer("_rope_cos", None, persistent=False)
-        self.register_buffer("_rope_sin", None, persistent=False)
+        rope_cos = rope_sin = None
+        if self.use_rope and self.max_seq_len is not None:
+            half = self.head_dim // 2
+            frequencies = torch.arange(half, dtype=torch.float32)
+            inverse = self.rope_theta ** (-frequencies / half)
+            positions = torch.arange(self.max_seq_len, dtype=torch.float32)
+            angles = torch.outer(positions, inverse)
+            rope_cos = angles.cos()[None, None]
+            rope_sin = angles.sin()[None, None]
+        self.register_buffer("_rope_cos", rope_cos, persistent=False)
+        self.register_buffer("_rope_sin", rope_sin, persistent=False)
 
     def _rope_tables(self, seq_len: int, device: torch.device) -> tuple[Tensor, Tensor]:
         rebuild = (
@@ -99,7 +117,12 @@ class Attention(nn.Module):
 
     def forward(self, hidden: Tensor) -> Tensor:
         batch, sequence, _ = hidden.shape
-        query, key, value = self.to_qkv(hidden).chunk(3, dim=-1)
+        if self.to_qkv is not None:
+            query, key, value = self.to_qkv(hidden).chunk(3, dim=-1)
+        else:
+            query = self.to_q(hidden)
+            key = self.to_k(hidden)
+            value = self.to_v(hidden)
 
         def split_heads(tensor: Tensor) -> Tensor:
             return tensor.view(batch, sequence, self.heads, self.head_dim).transpose(1, 2)
@@ -128,6 +151,7 @@ class SwiGLU(nn.Module):
         multiplier: float = 8.0 / 3.0,
         align_multiple: int = 64,
         bias: bool = False,
+        fused: bool = True,
     ) -> None:
         super().__init__()
         if hidden_dim is None:
@@ -135,11 +159,22 @@ class SwiGLU(nn.Module):
         if hidden_dim < 1:
             raise ValueError("hidden_dim must be positive")
         self.hidden_dim = int(hidden_dim)
-        self.proj_in = nn.Linear(dim, 2 * self.hidden_dim, bias=bias)
+        self.fused = bool(fused)
+        if self.fused:
+            self.proj_in = nn.Linear(dim, 2 * self.hidden_dim, bias=bias)
+            self.up_proj = self.gate_proj = None
+        else:
+            self.proj_in = None
+            self.up_proj = nn.Linear(dim, self.hidden_dim, bias=bias)
+            self.gate_proj = nn.Linear(dim, self.hidden_dim, bias=bias)
         self.proj_out = nn.Linear(self.hidden_dim, dim, bias=bias)
 
     def forward(self, hidden: Tensor) -> Tensor:
-        value, gate = self.proj_in(hidden).chunk(2, dim=-1)
+        if self.proj_in is not None:
+            value, gate = self.proj_in(hidden).chunk(2, dim=-1)
+        else:
+            value = self.up_proj(hidden)
+            gate = self.gate_proj(hidden)
         return self.proj_out(value * F.silu(gate))
 
 
@@ -158,6 +193,8 @@ class TransformerBlock(nn.Module):
         norm_eps: float = 1e-5,
         bias: bool = False,
         dropout: float = 0.0,
+        fused_qkv: bool = True,
+        fused_swiglu: bool = True,
     ) -> None:
         super().__init__()
         self.attn_norm = nn.RMSNorm(dim, eps=norm_eps)
@@ -171,6 +208,7 @@ class TransformerBlock(nn.Module):
             norm_eps=norm_eps,
             bias=bias,
             dropout=dropout,
+            fused_qkv=fused_qkv,
         )
         self.ff_norm = nn.RMSNorm(dim, eps=norm_eps)
         self.ff = SwiGLU(
@@ -178,6 +216,7 @@ class TransformerBlock(nn.Module):
             ff_hidden_dim,
             multiplier=ff_multiplier,
             bias=bias,
+            fused=fused_swiglu,
         )
 
     def forward(self, hidden: Tensor) -> Tensor:
@@ -207,6 +246,8 @@ class Transformer(nn.Module):
         input_projection: bool = False,
         bias: bool = False,
         dropout: float = 0.0,
+        fused_qkv: bool = True,
+        fused_swiglu: bool = True,
     ) -> None:
         super().__init__()
         if depth < 1 or dim < 1 or vocab_size < 2 or max_seq_len < 2:
@@ -240,6 +281,8 @@ class Transformer(nn.Module):
                     norm_eps=norm_eps,
                     bias=bias,
                     dropout=dropout,
+                    fused_qkv=fused_qkv,
+                    fused_swiglu=fused_swiglu,
                 )
                 for _ in range(depth)
             ]

@@ -50,6 +50,41 @@ def test_param_groups_route_embeddings_and_vectors_to_adam():
     assert id(model.linear.bias) in adam_ids
 
 
+def test_param_groups_can_mark_fused_matrices_for_logical_row_splitting():
+    model = torch.nn.Sequential(torch.nn.Linear(8, 24, bias=False))
+    groups = get_muon_param_groups(
+        model,
+        muon_split_predicate=lambda name, _parameter: 3 if name == "0.weight" else 1,
+    )
+
+    muon_group = next(group for group in groups if group["use_muon"])
+    assert muon_group["muon_split_count"] == 3
+    assert muon_group["params"] == [model[0].weight]
+
+
+def test_logically_split_muon_keeps_independent_block_state(monkeypatch):
+    parameter = torch.nn.Parameter(torch.randn(12, 4))
+    optimizer = MuonWarm(
+        [{"params": [parameter], "use_muon": True, "muon_split_count": 3}],
+        muon_warm_full_ns_steps=0,
+        muon_warm_anchor_every=1,
+    )
+    import muon_warm
+
+    monkeypatch.setattr(
+        muon_warm,
+        "_muon_ns5_prepared",
+        getattr(muon_warm._muon_ns5_prepared, "_torchdynamo_orig_callable"),
+    )
+    parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+
+    block_states = optimizer.state[parameter]["muon_block_states"]
+    assert len(block_states) == 3
+    assert all(state["muon_warm_q"].shape == (4, 4) for state in block_states)
+    assert all(state["momentum_fast"].shape == (4, 4) for state in block_states)
+
+
 def test_mixed_optimizer_runs_without_an_import_stub(monkeypatch):
     torch.manual_seed(61)
     model = torch.nn.Linear(8, 4)

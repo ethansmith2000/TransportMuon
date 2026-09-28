@@ -8,9 +8,11 @@ machine-readable summary suitable for the shared optimizer research journal.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
+import random
 import subprocess
 import time
 from collections import Counter
@@ -418,6 +420,13 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace, device: torch.de
                 and max(parameter.shape) <= args.muon_large_tensor_threshold
             )
 
+        def muon_split_count(name: str, _parameter: Tensor) -> int:
+            if args.muon_split_qkv and name.endswith(".attn.to_qkv.weight"):
+                return 3
+            if args.muon_split_swiglu and name.endswith(".ff.proj_in.weight"):
+                return 2
+            return 1
+
         groups = get_muon_param_groups(
             model,
             muon_lr=args.muon_lr,
@@ -429,6 +438,7 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace, device: torch.de
             adam_weight_decay=0.0,
             large_tensor_threshold=args.muon_large_tensor_threshold,
             muon_predicate=use_muon,
+            muon_split_predicate=muon_split_count,
         )
         return MuonWarm(
             groups,
@@ -565,7 +575,11 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
         "muon_reference_candidate_applied_sq_sum_tensor",
         "muon_reference_applied_sq_sum_tensor",
     )
-    for state in optimizer.state.values():
+    states = []
+    for parameter_state in optimizer.state.values():
+        block_states = parameter_state.get("muon_block_states")
+        states.extend(block_states if block_states is not None else (parameter_state,))
+    for state in states:
         state_bytes += _tree_tensor_bytes(state, seen)
         anchors.update(state.get("muon_warm_anchor_counts", {}))
         angular_checks += int(state.get("muon_warm_angular_checks", 0))
@@ -1125,6 +1139,62 @@ def _infinite(loader: DataLoader) -> Iterator[tuple[Tensor, Tensor]]:
         yield from loader
 
 
+class StatefulBatchStream:
+    """Infinite DataLoader stream with an exactly replayable shuffle position."""
+
+    def __init__(
+        self,
+        loader: DataLoader,
+        generator: torch.Generator,
+        state: dict[str, Any] | None = None,
+    ) -> None:
+        self.loader = loader
+        self.generator = generator
+        self.epoch_generator_state = torch.empty(0, dtype=torch.uint8)
+        self.batches_consumed = 0
+        self.iterator: Iterator[tuple[Tensor, Tensor]]
+        if state is None:
+            self._start_epoch()
+        else:
+            self.generator.set_state(state["epoch_generator_state"])
+            self._start_epoch()
+            expected = int(state["batches_consumed"])
+            if not 0 <= expected <= len(loader):
+                raise ValueError("checkpoint has an invalid training-loader position")
+            for _ in range(expected):
+                try:
+                    next(self.iterator)
+                except StopIteration as error:
+                    raise ValueError(
+                        "checkpoint training-loader position exceeds the epoch"
+                    ) from error
+                self.batches_consumed += 1
+
+    def _start_epoch(self) -> None:
+        # DataLoader and RandomSampler both consume this dedicated generator.
+        # Saving its state before iterator creation reproduces the same worker
+        # seed and permutation, after which replay only has to skip delivered
+        # batches within the epoch.
+        self.epoch_generator_state = self.generator.get_state().clone()
+        self.iterator = iter(self.loader)
+        self.batches_consumed = 0
+
+    def __next__(self) -> tuple[Tensor, Tensor]:
+        try:
+            batch = next(self.iterator)
+        except StopIteration:
+            self._start_epoch()
+            batch = next(self.iterator)
+        self.batches_consumed += 1
+        return batch
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "epoch_generator_state": self.epoch_generator_state.clone(),
+            "batches_consumed": self.batches_consumed,
+        }
+
+
 def _schedule_multiplier(step: int, args: argparse.Namespace) -> float:
     if args.warmup_steps > 0 and step < args.warmup_steps:
         return (step + 1) / args.warmup_steps
@@ -1167,9 +1237,126 @@ def _git_metadata(root: Path) -> dict[str, Any]:
     }
 
 
+_OPERATIONAL_CONFIG_KEYS = {
+    "checkpoint",
+    "checkpoint_every",
+    "config",
+    "output",
+    "resume",
+    "stop_after_step",
+}
+
+
+def _comparable_config(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in config.items()
+        if key not in _OPERATIONAL_CONFIG_KEYS
+    }
+
+
+def _load_resume_checkpoint(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.resume is None:
+        return None
+    checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+    if checkpoint.get("format_version") != 1:
+        raise ValueError(
+            "resume checkpoint is missing the exact-training format version"
+        )
+    saved_config = _comparable_config(checkpoint["config"])
+    current_config = _comparable_config(vars(args))
+    mismatches = {
+        key: (saved_config.get(key), current_config.get(key))
+        for key in saved_config.keys() | current_config.keys()
+        if saved_config.get(key) != current_config.get(key)
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{key}={old!r}->{new!r}"
+            for key, (old, new) in sorted(mismatches.items())
+        )
+        raise ValueError(f"resume configuration does not match checkpoint: {details}")
+    return checkpoint
+
+
+def _rng_state() -> dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def _restore_rng_state(state: dict[str, Any]) -> None:
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch_cpu"])
+    if state["torch_cuda"]:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _atomic_torch_save(value: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    torch.save(value, temporary)
+    os.replace(temporary, path)
+
+
+def _move_optimizer_value_exact(value: Any, device: torch.device) -> Any:
+    if torch.is_tensor(value):
+        return value.to(device=device)
+    if isinstance(value, dict):
+        return {
+            key: _move_optimizer_value_exact(item, device)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_move_optimizer_value_exact(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_optimizer_value_exact(item, device) for item in value)
+    return copy.deepcopy(value)
+
+
+def _load_optimizer_state_exact(optimizer, saved: dict[str, Any]) -> None:
+    """Load optimizer state without casting BF16 caches to parameter dtype."""
+    optimizer.load_state_dict(saved)
+    saved_ids = [
+        parameter_id
+        for group in saved["param_groups"]
+        for parameter_id in group["params"]
+    ]
+    current_parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    if len(saved_ids) != len(current_parameters):
+        raise ValueError("optimizer checkpoint parameter count does not match")
+    parameter_by_saved_id = dict(zip(saved_ids, current_parameters))
+    optimizer.state.clear()
+    for parameter_id, state in saved["state"].items():
+        parameter = parameter_by_saved_id[parameter_id]
+        optimizer.state[parameter] = _move_optimizer_value_exact(
+            state,
+            parameter.device,
+        )
+
+
 def train(args: argparse.Namespace) -> dict[str, Any]:
     if args.steps < 1 or args.gradient_accumulation_steps < 1:
         raise ValueError("steps and gradient_accumulation_steps must be positive")
+    if args.checkpoint_every < 0:
+        raise ValueError("checkpoint_every must be non-negative")
+    if args.checkpoint_every > 0 and args.checkpoint is None:
+        raise ValueError("checkpoint_every requires --checkpoint")
+    if args.stop_after_step < 0 or args.stop_after_step > args.steps:
+        raise ValueError("stop_after_step must be between zero and steps")
+    if args.stop_after_step > 0 and args.checkpoint is None:
+        raise ValueError("stop_after_step requires --checkpoint")
+    if (args.checkpoint is not None or args.resume is not None) and args.muon_async_checks:
+        raise ValueError(
+            "exact checkpoints do not support pending asynchronous Muon checks"
+        )
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -1178,6 +1365,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
+    resume_checkpoint = _load_resume_checkpoint(args)
 
     train_dataset, validation_dataset, vocab_size = build_datasets(args)
     generator = torch.Generator().manual_seed(args.seed)
@@ -1219,32 +1407,125 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         input_projection=args.input_projection,
         bias=args.bias,
         dropout=args.dropout,
+        fused_qkv=args.fused_qkv,
+        fused_swiglu=args.fused_swiglu,
     ).to(device)
     optimizer = build_optimizer(model, args, device)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lambda step: _schedule_multiplier(step, args),
     )
+    if resume_checkpoint is not None:
+        model.load_state_dict(resume_checkpoint["model"])
+        _load_optimizer_state_exact(optimizer, resume_checkpoint["optimizer"])
+        scheduler.load_state_dict(resume_checkpoint["scheduler"])
     training_model = torch.compile(
         model,
         mode=args.compile_mode,
-        fullgraph=False,
+        fullgraph=args.compile_fullgraph,
     ) if args.compile else model
 
-    history: list[dict[str, Any]] = []
-    stream = _infinite(train_loader)
+    start_step = int(resume_checkpoint["step"]) if resume_checkpoint else 0
+    if not 0 <= start_step < args.steps:
+        raise ValueError(
+            f"resume step {start_step} must be smaller than target steps {args.steps}"
+        )
+    execution_end = (
+        min(args.steps, args.stop_after_step)
+        if args.stop_after_step > 0
+        else args.steps
+    )
+    if execution_end <= start_step:
+        raise ValueError(
+            f"stop_after_step {execution_end} must exceed resume step {start_step}"
+        )
+    history: list[dict[str, Any]] = (
+        list(resume_checkpoint["history"]) if resume_checkpoint else []
+    )
+    stream = StatefulBatchStream(
+        train_loader,
+        generator,
+        resume_checkpoint["data_stream"] if resume_checkpoint else None,
+    )
     optimizer.zero_grad(set_to_none=True)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
+    if resume_checkpoint is not None:
+        _restore_rng_state(resume_checkpoint["rng"])
     wall_start = time.perf_counter()
-    timed_tokens = 0
+    saved_timing = resume_checkpoint.get("timing", {}) if resume_checkpoint else {}
+    timed_tokens = int(saved_timing.get("timed_tokens", 0))
+    prior_wall_seconds = float(saved_timing.get("wall_seconds", 0.0))
+    prior_peak_memory = int(saved_timing.get("peak_memory_bytes", 0))
+    checkpoint_io_seconds = 0.0
     step_events = []
     optimizer_events = []
-    optimizer_event_kinds: list[str] = []
-    last_loss = math.nan
+    step_measurements: list[float] = list(
+        saved_timing.get("step_measurements", [])
+    )
+    optimizer_measurements: list[float] = list(
+        saved_timing.get("optimizer_measurements", [])
+    )
+    optimizer_event_kinds: list[str] = list(
+        saved_timing.get("optimizer_event_kinds", [])
+    )
+    last_loss = float(resume_checkpoint.get("last_loss", math.nan)) if resume_checkpoint else math.nan
+    last_checkpoint_step = start_step
 
-    for step in range(1, args.steps + 1):
+    def drain_cuda_timings() -> None:
+        if device.type != "cuda" or not step_events:
+            return
+        torch.cuda.synchronize(device)
+        step_measurements.extend(
+            start.elapsed_time(end) for start, end in step_events
+        )
+        optimizer_measurements.extend(
+            start.elapsed_time(end) for start, end in optimizer_events
+        )
+        step_events.clear()
+        optimizer_events.clear()
+
+    def save_checkpoint(step: int) -> None:
+        nonlocal checkpoint_io_seconds, last_checkpoint_step
+        if args.checkpoint is None:
+            return
+        drain_cuda_timings()
+        peak_memory_bytes = prior_peak_memory
+        if device.type == "cuda":
+            peak_memory_bytes = max(
+                peak_memory_bytes,
+                int(torch.cuda.max_memory_allocated(device)),
+            )
+        checkpoint_start = time.perf_counter()
+        _atomic_torch_save(
+            {
+                "format_version": 1,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "config": vars(args),
+                "step": step,
+                "history": history,
+                "last_loss": last_loss,
+                "data_stream": stream.state_dict(),
+                "rng": _rng_state(),
+                "timing": {
+                    "timed_tokens": timed_tokens,
+                    "step_measurements": step_measurements,
+                    "optimizer_measurements": optimizer_measurements,
+                    "optimizer_event_kinds": optimizer_event_kinds,
+                    "wall_seconds": prior_wall_seconds
+                    + (time.perf_counter() - wall_start - checkpoint_io_seconds),
+                    "peak_memory_bytes": peak_memory_bytes,
+                },
+            },
+            Path(args.checkpoint),
+        )
+        checkpoint_io_seconds += time.perf_counter() - checkpoint_start
+        last_checkpoint_step = step
+
+    for step in range(start_step + 1, execution_end + 1):
         timed = step > args.timing_warmup
         if timed and device.type == "cuda":
             step_start = torch.cuda.Event(enable_timing=True)
@@ -1311,15 +1592,17 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if record:
             history.append(record)
             print(json.dumps(record, sort_keys=True), flush=True)
+        if (
+            args.checkpoint_every > 0
+            and step % args.checkpoint_every == 0
+        ):
+            save_checkpoint(step)
+
+    if args.checkpoint is not None and last_checkpoint_step != execution_end:
+        save_checkpoint(execution_end)
 
     if device.type == "cuda":
-        torch.cuda.synchronize(device)
-        step_measurements = [
-            start.elapsed_time(end) for start, end in step_events
-        ]
-        optimizer_measurements = [
-            start.elapsed_time(end) for start, end in optimizer_events
-        ]
+        drain_cuda_timings()
         step_ms = sum(step_measurements)
         optimizer_ms = sum(optimizer_measurements)
         optimizer_timing_by_kind = {}
@@ -1339,7 +1622,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     "p95_milliseconds": _percentile(measurements, 0.95),
                     "maximum_milliseconds": max(measurements),
                 }
-        peak_memory = torch.cuda.max_memory_allocated(device)
+        peak_memory = max(
+            prior_peak_memory,
+            int(torch.cuda.max_memory_allocated(device)),
+        )
     else:
         step_measurements = []
         optimizer_measurements = []
@@ -1347,8 +1633,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         optimizer_ms = math.nan
         optimizer_timing_by_kind = {}
         peak_memory = 0
-    wall_seconds = time.perf_counter() - wall_start
-    measured_steps = max(1, args.steps - args.timing_warmup)
+    wall_seconds = prior_wall_seconds + (
+        time.perf_counter() - wall_start - checkpoint_io_seconds
+    )
+    measured_steps = max(1, len(step_measurements))
     final_validation = evaluate(
         training_model,
         validation_loader,
@@ -1371,6 +1659,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 if args.input_projection
                 else "embedding->pre_norm_blocks->final_norm->lm_head"
             ),
+            "fused_qkv": args.fused_qkv,
+            "fused_swiglu": args.fused_swiglu,
+            "qk_norm": args.qk_norm,
         },
         "data": {
             "train_sequences": len(train_dataset),
@@ -1383,6 +1674,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 if args.token_cache is not None and args.token_cache.exists()
                 else 0.0
             ),
+        },
+        "progress": {
+            "completed": execution_end == args.steps,
+            "completed_steps": execution_end,
+            "target_steps": args.steps,
+            "resumed_from_step": start_step,
         },
         "final": {
             "train_loss": last_loss,
@@ -1412,19 +1709,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "optimizer": optimizer_diagnostics(optimizer),
         "history": history,
     }
-    if args.checkpoint:
-        checkpoint_path = Path(args.checkpoint)
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "config": vars(args),
-                "step": args.steps,
-            },
-            checkpoint_path,
-        )
     return result
 
 
@@ -1479,6 +1763,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-projection", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--bias", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--fused-qkv", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fused-swiglu", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--steps", type=int, default=1000)
@@ -1503,13 +1789,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16" if torch.cuda.is_available() else "float32")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compile-mode", default="default")
+    parser.add_argument(
+        "--compile-fullgraph",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="atomically updated exact-training checkpoint",
+    )
+    parser.add_argument("--checkpoint-every", type=int, default=0)
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--stop-after-step",
+        type=int,
+        default=0,
+        help="stop this invocation early while retaining --steps as the schedule horizon",
+    )
 
     parser.add_argument("--muon-lr", type=float, default=0.02)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
     parser.add_argument("--muon-ns-steps", type=int, default=5)
     parser.add_argument("--muon-nesterov", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--muon-split-qkv", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--muon-split-swiglu", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--muon-anchor-every", type=int, default=8)
     parser.add_argument("--muon-max-age", type=int, default=0)
     parser.add_argument("--muon-check-every", type=int, default=1)
@@ -1581,6 +1886,8 @@ def parse_args() -> argparse.Namespace:
         args.output = Path(args.output)
     if args.checkpoint is not None:
         args.checkpoint = Path(args.checkpoint)
+    if args.resume is not None:
+        args.resume = Path(args.resume)
     if args.cache_dir is not None:
         args.cache_dir = Path(args.cache_dir)
     if args.token_cache is not None:

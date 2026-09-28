@@ -421,7 +421,21 @@ stream directly, followed by pre-norm RMSNorm blocks, RoPE attention with option
 QK normalization, bias-free SwiGLU, a final RMSNorm, and a tied LM head. The
 nonstandard input projection from the imported trainer is disabled by default;
 `--input-projection` retains it as an explicit ablation. RMSNorm uses an explicit
-`1e-5` epsilon under BF16.
+`1e-5` epsilon under BF16. QK normalization is per head dimension and is applied
+before RoPE. QKV and the two SwiGLU input projections remain fused by default for
+the forward pass; `--no-fused-qkv` and `--no-fused-swiglu` expose physical-split
+architecture controls.
+
+For Muon, `--muon-split-qkv` and `--muon-split-swiglu` preserve those fused
+forward GEMMs but orthogonalize the three Q/K/V and two value/gate gradient row
+blocks independently. Every logical block gets its own momentum, transported
+polar cache, and refresh decision. This matches the optimizer topology without
+paying for separate model projections. Existing configurations keep whole-tensor
+behavior unless the flags are set.
+
+CUDA AdamW already uses PyTorch's fused implementation. `--compile` enables
+`torch.compile`, and `--compile-fullgraph` requests the full-graph behavior used
+by the larger target profile.
 
 `train_llm.py` is self-contained and defaults to a structured synthetic dataset,
 so the complete model/optimizer path can be checked offline:
@@ -449,6 +463,91 @@ tokens and 262,144 validation tokens, and share a roughly 11 MB int32 token cach
   --config configs/llm_openwebtext_transport_1000.json \
   --output transport_openwebtext_1000.json
 ```
+
+### Width-768 target screen
+
+The first target-regime screen uses a 95.2M-parameter decoder at width 768,
+depth 8, 12 heads, batch 32, and sequence length 1024. All runs use BF16,
+full-graph compilation, QK normalization, fused QKV/SwiGLU forward projections,
+and independent logical Q/K/V and SwiGLU Muon states. Each 50-step run consumes
+1.638M training tokens, so it fits within the 2.5M-token int32 cache without
+repeating a sequence.
+
+The seed-123 rate sweep selected Muon LR `0.06`: losses improved monotonically
+from `0.01` through `0.06`, then regressed at `0.08`. A matched three-seed check
+gave:
+
+| Profile | Mean validation loss | Mean step ms | Mean optimizer ms | State MiB | Mean adaptive anchors |
+|---|---:|---:|---:|---:|---:|
+| Fused AdamW, LR `4e-4` | 7.04498 | **134.67** | **1.76** | 726.58 | 0 |
+| Angular threshold 2, Muon LR `0.06` | 6.60473 | 171.95 | 42.58 | **618.67** | 226.7 |
+| Skew ratio 0.52, Muon LR `0.06` | **6.59310** | 173.21 | 43.87 | **618.67** | **104.0** |
+| Smaller-side SOAP, LR `1.25e-4` | 6.89174 | 146.15 | 14.55 | 870.58 | 0 |
+
+Skew ratio 0.52 slightly improves the mean over angular threshold 2 and cuts
+adaptive anchors by 54%. It is nevertheless about 1.25 ms slower per step:
+fewer anchors leave more warm transport and output-retraction steps. This makes
+the warm path, especially its power probe and checked retraction, the next
+performance target; reducing refresh count alone does not reduce wall time in
+this regime.
+
+These are learning-rate and integration screens, not long-run convergence
+claims. The complete rate sweep, seed rows, timing, memory, and source artifact
+names are in
+`../optimizer_replay_results/llm_openwebtext_modern_768x8_50step_summary.json`.
+The next gate will use a larger int32-only token cache so the frozen candidates
+can run longer without recycling training sequences.
+
+The cache has now been expanded to 40M training tokens plus the 262,144-token
+validation prefix. It occupies 153.6 MiB and retains only int32 token IDs. A
+matched 200-step, three-seed gate consumes 6.554M distinct training tokens per
+run and gives:
+
+| Profile | Validation loss, mean ± sd | Mean step ms | Mean optimizer ms | State MiB | Mean adaptive anchors |
+|---|---:|---:|---:|---:|---:|
+| Fused AdamW, LR `4e-4` | 6.09585 ± 0.03048 | **135.75** | **1.76** | 726.58 | 0 |
+| Smaller-side SOAP, LR `1.25e-4` | 5.90796 ± 0.01387 | 146.81 | 13.54 | 870.58 | 0 |
+| Angular threshold 2, Muon LR `0.06` | 5.67133 ± 0.00135 | 172.71 | 42.25 | **618.58** | 666.3 |
+| Skew ratio 0.52, Muon LR `0.06` | **5.66059 ± 0.00539** | 174.44 | 43.73 | **618.58** | **356.0** |
+
+Skew leads angular at every averaged validation checkpoint and improves final
+mean loss by `0.01074`. It cuts adaptive anchors by 46.6%, but executes 310 more
+warm output retractions per run and remains 1.0% slower. The same conclusion
+therefore holds over the longer gate: optimize the warm transport kernel before
+spending effort on still fewer refreshes. Relative to AdamW, skew improves mean
+loss by `0.43526`, costs 28.5% more per step, and uses 108.0 MiB less optimizer
+state.
+
+The complete curves and per-seed evidence are in
+`../optimizer_replay_results/llm_openwebtext_modern_768x8_200step_three_seed_summary.json`.
+
+A shape-matched component benchmark at logical matrix sizes `768x768` and
+`768x2048` then separated the warm geometry, local output filter, controller
+signal, and full anchor. At drift `0.50`, the two-power-iteration warm output
+took `0.505/0.539` ms, versus `0.834/0.857` ms for a full anchor. Reducing the
+power estimate to one iteration lowered the warm output to `0.454/0.509` ms.
+The resulting BF16 direction was identical to the two-iteration direction in
+these prepared probes. The skew signal itself cost `0.624/0.668` ms, slightly
+more than the angular signal's `0.595/0.633` ms. Component artifacts for drifts
+`0.08`, `0.25`, and `0.50` are stored as
+`../optimizer_replay_results/transport_warm_components_768*.json`.
+
+The one-power-iteration change also passes the full three-seed 200-step gate:
+
+| Skew 0.52 profile | Validation loss, mean ± sd | Step ms | Optimizer ms | Tokens/s | Adaptive anchors |
+|---|---:|---:|---:|---:|---:|
+| Two power iterations | 5.66059 ± 0.00539 | 174.44 | 43.73 | 187,846 | 356.0 |
+| One power iteration | 5.66084 ± 0.01749 | **170.67** | **40.70** | **191,996** | **351.3** |
+
+One iteration changes mean validation loss by only `+0.00025`, reduces optimizer
+time by 6.9% and total step time by 2.2%, and improves throughput by 2.2%. Its
+mean transport step scale is larger (`0.01370` versus `0.00920`), so the longer
+gate must continue reporting the minimum scale, refresh causes, and stability.
+It is the current Transport efficiency candidate; the two-iteration profile is
+retained as the matched control.
+
+The next training gate can run 1,000 steps without sequence reuse from the same
+cache. Exact resumable checkpoint support comes first.
 
 The optional two-retraction profile is a geometry/quality candidate:
 
@@ -541,6 +640,46 @@ exact singular values under slow rotations and an abrupt basis shock. The
 ordinary transport microbenchmark accepts `--spectral-cap-mode`,
 `--power-steps`, `--power-safety-factor`, and `--normal-inv-cap` for isolated
 cost measurement.
+
+The modern width-768 gate now extends to 1,000 steps and seeds 123, 456, and
+789. With batch 32, sequence length 1024, BF16, and full-graph compilation, the
+matched results are:
+
+| Profile | Validation loss, mean ± sd | Step ms | Optimizer ms | Tokens/s | State MiB |
+|---|---:|---:|---:|---:|---:|
+| AdamW `4e-4` | 4.75432 ± 0.00774 | **137.92** | **1.76** | **237,607** | 726.58 |
+| Smaller-side SOAP `1.25e-4` | 4.61910 ± 0.01213 | 148.34 | 13.52 | 220,899 | 870.58 |
+| Transport skew 0.52, one power iteration, `0.06` | **4.23854 ± 0.00144** | 171.27 | 40.65 | 191,325 | **618.58** |
+
+One-power Transport averages 2,314.7 adaptive anchors and 46,629.3 warm output
+retractions. Its three final losses span only 0.00286. In the matched seed-123
+control it improves validation loss by 0.00499 over two power iterations while
+reducing optimizer time by 6.8% and total step time by 1.6%. This promotes one
+power iteration as the next-scale efficiency candidate while retaining the
+two-power profile as its numerical control. The complete curves and raw source
+paths are in
+`../optimizer_replay_results/llm_openwebtext_modern_768x8_1000step_three_seed_summary.json`.
+
+Long runs support atomic rolling checkpoints with exact shuffled-data position,
+model, optimizer, scheduler, and RNG state:
+
+```bash
+/venv/main/bin/python train_llm.py \
+  --config configs/llm_openwebtext_modern_768x8_transport_skew052_power1_muonlr006_batch32_seq1024_1000.json \
+  --checkpoint /workspace/optimizer_checkpoints/transport.pt \
+  --checkpoint-every 100
+
+/venv/main/bin/python train_llm.py \
+  --config configs/llm_openwebtext_modern_768x8_transport_skew052_power1_muonlr006_batch32_seq1024_1000.json \
+  --resume /workspace/optimizer_checkpoints/transport.pt
+```
+
+Keep the original target `--steps` and schedule when resuming. CPU controls are
+bitwise exact across an interruption, including an epoch boundary. Compiled CUDA
+controls reproduce every logged loss and controller event; reconstruction can
+change final FP32 state by about `1e-9` because GPU reduction order is not
+bitwise fixed. Exact checkpointing rejects asynchronous Muon checks because a
+pending CUDA event cannot be serialized faithfully.
 
 `--hf-streaming` reads only the bounded sample. `--max-train-tokens` and
 `--max-validation-tokens` cap RAM and token-cache usage, while `--token-cache`

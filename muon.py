@@ -43,6 +43,7 @@ def get_muon_param_groups(
     adam_weight_decay: float = 0.0,
     large_tensor_threshold: int = 16384,
     muon_predicate: Callable[[str, Tensor], bool] | None = None,
+    muon_split_predicate: Callable[[str, Tensor], int] | None = None,
 ) -> list[dict]:
     """Split trainable parameters into Muon and Adam groups.
 
@@ -50,6 +51,9 @@ def get_muon_param_groups(
     is at most ``large_tensor_threshold``. Embedding tables, vectors, scalars,
     and larger axes use Adam. ``muon_predicate`` can override this decision for
     non-embedding parameters using their ``named_parameters`` name and tensor.
+    ``muon_split_predicate`` may return a row-block count for fused matrices;
+    the optimizer then keeps independent Muon state and polar solves for those
+    logical blocks while the model parameter remains fused.
     """
     if int(large_tensor_threshold) < 1:
         raise ValueError("large_tensor_threshold must be >= 1")
@@ -60,7 +64,7 @@ def get_muon_param_groups(
         if isinstance(module, nn.Embedding)
         for parameter in module.parameters(recurse=False)
     }
-    muon_parameters: list[Tensor] = []
+    muon_parameters: dict[int, list[Tensor]] = {}
     adam_parameters: list[Tensor] = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
@@ -72,14 +76,32 @@ def get_muon_param_groups(
         )
         if muon_predicate is not None and id(parameter) not in embedding_parameters:
             use_muon = bool(muon_predicate(name, parameter))
-        (muon_parameters if use_muon else adam_parameters).append(parameter)
+        if use_muon:
+            split_count = (
+                int(muon_split_predicate(name, parameter))
+                if muon_split_predicate is not None
+                else 1
+            )
+            if split_count < 1:
+                raise ValueError("Muon split counts must be positive")
+            if split_count > 1 and (
+                parameter.ndim != 2 or parameter.shape[0] % split_count
+            ):
+                raise ValueError(
+                    f"Cannot split Muon parameter {name!r} with shape "
+                    f"{tuple(parameter.shape)} into {split_count} row blocks"
+                )
+            muon_parameters.setdefault(split_count, []).append(parameter)
+        else:
+            adam_parameters.append(parameter)
 
     groups: list[dict] = []
-    if muon_parameters:
+    for split_count, parameters in sorted(muon_parameters.items()):
         groups.append(
             {
-                "params": muon_parameters,
+                "params": parameters,
                 "use_muon": True,
+                "muon_split_count": split_count,
                 "lr": float(muon_lr),
                 "momentum": float(muon_momentum),
                 "weight_decay": float(muon_weight_decay),

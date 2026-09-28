@@ -1782,6 +1782,7 @@ class MuonWarm(torch.optim.Optimizer):
                 group["use_muon"] = True
             
             if group["use_muon"]:
+                group.setdefault("muon_split_count", 1)
                 group.setdefault("lr", muon_lr)
                 group.setdefault("momentum", muon_momentum)
                 group.setdefault("weight_decay", muon_weight_decay)
@@ -1997,16 +1998,20 @@ class MuonWarm(torch.optim.Optimizer):
             if not group.get("use_muon", False):
                 continue
             for parameter in group["params"]:
-                state = self.state.get(parameter)
-                if not state:
+                parameter_state = self.state.get(parameter)
+                if not parameter_state:
                     continue
-                next_step = int(state.get("step", 0)) + 1
-                if next_step % self.muon_warm_check_every != 0:
-                    continue
-                signal = state.get(signal_key)
-                if signal is None:
-                    continue
-                by_device.setdefault(signal.device, []).append((state, signal))
+                states = parameter_state.get("muon_block_states")
+                if states is None:
+                    states = (parameter_state,)
+                for state in states:
+                    next_step = int(state.get("step", 0)) + 1
+                    if next_step % self.muon_warm_check_every != 0:
+                        continue
+                    signal = state.get(signal_key)
+                    if signal is None:
+                        continue
+                    by_device.setdefault(signal.device, []).append((state, signal))
         for entries in by_device.values():
             device = entries[0][1].device
             pending_checks = self._muon_warm_pending_drift_checks
@@ -2914,20 +2919,59 @@ class MuonWarm(torch.optim.Optimizer):
                     if p.grad is None:
                         p.grad = torch.zeros_like(p)  # Force synchronization
                     state = self.state[p]
-                    
-                    if len(state) == 0:
-                        state["momentum_fast"] = torch.zeros_like(p)
-                        state["step"] = 0
-                        if self.muon_warm_anchor_every > 0:
-                            state["muon_warm_anchor_offset"] = (
-                                self._next_muon_anchor_offset
-                                % self.muon_warm_anchor_every
+                    split_count = int(group.get("muon_split_count", 1))
+                    if split_count > 1:
+                        if p.ndim != 2 or p.shape[0] % split_count:
+                            raise ValueError(
+                                f"Muon row split {split_count} is incompatible "
+                                f"with parameter shape {tuple(p.shape)}"
                             )
-                            self._next_muon_anchor_offset += 1
-                    
-                    state["step"] += 1
-                    
-                    update = self._muon_update_warm(p.grad, state, group)
+                        if len(state) == 0:
+                            state["muon_block_states"] = [
+                                {} for _ in range(split_count)
+                            ]
+                        block_states = state.get("muon_block_states")
+                        if block_states is None or len(block_states) != split_count:
+                            raise ValueError(
+                                "Loaded Muon block state does not match the "
+                                "configured row split"
+                            )
+                        updates = []
+                        for grad_block, block_state in zip(
+                            p.grad.chunk(split_count, dim=0), block_states
+                        ):
+                            if len(block_state) == 0:
+                                block_state["momentum_fast"] = torch.zeros_like(
+                                    grad_block
+                                )
+                                block_state["step"] = 0
+                                if self.muon_warm_anchor_every > 0:
+                                    block_state["muon_warm_anchor_offset"] = (
+                                        self._next_muon_anchor_offset
+                                        % self.muon_warm_anchor_every
+                                    )
+                                    self._next_muon_anchor_offset += 1
+                            block_state["step"] += 1
+                            updates.append(
+                                self._muon_update_warm(
+                                    grad_block,
+                                    block_state,
+                                    group,
+                                )
+                            )
+                        update = torch.cat(updates, dim=0)
+                    else:
+                        if len(state) == 0:
+                            state["momentum_fast"] = torch.zeros_like(p)
+                            state["step"] = 0
+                            if self.muon_warm_anchor_every > 0:
+                                state["muon_warm_anchor_offset"] = (
+                                    self._next_muon_anchor_offset
+                                    % self.muon_warm_anchor_every
+                                )
+                                self._next_muon_anchor_offset += 1
+                        state["step"] += 1
+                        update = self._muon_update_warm(p.grad, state, group)
                     
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
