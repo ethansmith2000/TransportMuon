@@ -490,10 +490,20 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace, device: torch.de
             shampoo_beta=args.soap_shampoo_beta,
             eps=args.eps,
             precondition_frequency=args.soap_precondition_frequency,
+            precondition_frequency_after_warmup=(
+                args.soap_precondition_frequency_after_warmup
+            ),
+            precondition_frequency_warmup_steps=(
+                args.soap_precondition_frequency_warmup_steps
+            ),
+            basis_residual_threshold=args.soap_residual_threshold,
+            basis_residual_max_age=args.soap_residual_max_age,
+            basis_residual_warmup_steps=args.soap_residual_warmup_steps,
             precondition_mode=args.soap_precondition_mode,
             precondition_aspect_ratio=args.soap_precondition_aspect_ratio,
             normalize_grads=args.soap_normalize_grads,
             basis_reset_frequency=args.soap_reset_frequency,
+            basis_reset_max_age=args.soap_reset_max_age,
             basis_reset_stagger=args.soap_reset_stagger,
             basis_reset_method=args.soap_reset_method,
             basis_track_stats=args.soap_track_stats,
@@ -526,9 +536,14 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
     async_checks_submitted = async_checks_completed = 0
     async_enqueue_skips = async_stale_checks = 0
     warm_steps = warm_retractions = output_retractions = 0
-    basis_refreshes = active_factors = 0
+    basis_refreshes = basis_active_refreshes = active_factors = 0
+    basis_residual_checks = basis_residual_skips = 0
+    basis_residual_threshold_refreshes = basis_residual_max_age_refreshes = 0
+    basis_residual_ratio_sum = basis_residual_ratio_max = 0.0
+    basis_residual_ratio_samples: list[float] = []
     hard_reset_events = hard_reset_factors = 0
     reset_first_refreshes: list[int] = []
+    reset_first_steps: list[int] = []
     seen: set[int] = set()
     state_bytes = 0
     update_elements = update_samples = 0
@@ -619,6 +634,30 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
             state.get("muon_warm_output_retractions", 0)
         )
         basis_refreshes += int(state.get("basis_refreshes", 0))
+        basis_active_refreshes += int(
+            state.get("basis_active_refreshes", 0)
+        )
+        state_residual_checks = int(state.get("basis_residual_checks", 0))
+        basis_residual_checks += state_residual_checks
+        basis_residual_skips += int(state.get("basis_residual_skips", 0))
+        basis_residual_threshold_refreshes += int(
+            state.get("basis_residual_threshold_refreshes", 0)
+        )
+        basis_residual_max_age_refreshes += int(
+            state.get("basis_residual_max_age_refreshes", 0)
+        )
+        if state_residual_checks > 0:
+            basis_residual_ratio_sum += float(
+                state.get("basis_residual_ratio_sum", 0.0)
+            )
+            basis_residual_ratio_max = max(
+                basis_residual_ratio_max,
+                float(state.get("basis_residual_ratio_max", 0.0)),
+            )
+            basis_residual_ratio_samples.extend(
+                float(value)
+                for value in state.get("basis_residual_ratio_samples", ())
+            )
         state_active_factors = sum(
             value is not None for value in state.get("Q", ())
         )
@@ -629,6 +668,8 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
             reset_first_refreshes.append(
                 int(state["basis_reset_first_refresh"])
             )
+        if state_active_factors > 0 and "basis_reset_first_step" in state:
+            reset_first_steps.append(int(state["basis_reset_first_step"]))
         update_elements += int(state.get("muon_update_elements", 0))
         update_samples += int(state.get("muon_update_samples", 0))
         reference_elements += int(state.get("muon_reference_elements", 0))
@@ -814,6 +855,7 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
         "warm_retractions": warm_retractions,
         "output_retractions": output_retractions,
         "basis_refreshes": basis_refreshes,
+        "basis_active_refreshes": basis_active_refreshes,
         "active_factors": active_factors,
         "hard_reset_events": hard_reset_events,
         "hard_reset_factors": hard_reset_factors,
@@ -823,6 +865,31 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
             min(reset_first_refreshes),
             max(reset_first_refreshes),
         ]
+    if reset_first_steps:
+        diagnostics["reset_first_step_range"] = [
+            min(reset_first_steps),
+            max(reset_first_steps),
+        ]
+    if basis_residual_checks > 0 or basis_residual_max_age_refreshes > 0:
+        diagnostics["basis_residual_gate"] = {
+            "checks": basis_residual_checks,
+            "skips": basis_residual_skips,
+            "threshold_refreshes": basis_residual_threshold_refreshes,
+            "max_age_refreshes": basis_residual_max_age_refreshes,
+            "mean_checked_residual": (
+                basis_residual_ratio_sum / basis_residual_checks
+                if basis_residual_checks > 0
+                else 0.0
+            ),
+            "maximum_checked_residual": basis_residual_ratio_max,
+        }
+        if basis_residual_ratio_samples:
+            diagnostics["basis_residual_gate"]["checked_residual_percentiles"] = {
+                "p50": _percentile(basis_residual_ratio_samples, 0.50),
+                "p75": _percentile(basis_residual_ratio_samples, 0.75),
+                "p90": _percentile(basis_residual_ratio_samples, 0.90),
+                "p95": _percentile(basis_residual_ratio_samples, 0.95),
+            }
     if update_elements > 0:
         direction_sq = statistic_sums["muon_update_direction_sq_sum_tensor"]
         momentum_sq = statistic_sums["muon_update_momentum_sq_sum_tensor"]
@@ -1912,6 +1979,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--soap-fallback-lr", type=float, default=3e-4)
     parser.add_argument("--soap-precondition-frequency", type=int, default=10)
     parser.add_argument(
+        "--soap-precondition-frequency-after-warmup", type=int, default=0
+    )
+    parser.add_argument(
+        "--soap-precondition-frequency-warmup-steps", type=int, default=0
+    )
+    parser.add_argument("--soap-residual-threshold", type=float, default=0.0)
+    parser.add_argument("--soap-residual-max-age", type=int, default=40)
+    parser.add_argument("--soap-residual-warmup-steps", type=int, default=0)
+    parser.add_argument(
         "--soap-precondition-mode",
         choices=("all", "smaller_side", "aspect_ratio"),
         default="smaller_side",
@@ -1920,6 +1996,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--soap-max-precond-dim", type=int, default=10_000)
     parser.add_argument("--soap-normalize-grads", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--soap-reset-frequency", type=int, default=20)
+    parser.add_argument("--soap-reset-max-age", type=int, default=0)
     parser.add_argument(
         "--soap-reset-stagger",
         action=argparse.BooleanOptionalAction,

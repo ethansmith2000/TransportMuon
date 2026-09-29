@@ -35,6 +35,12 @@ def test_local_optimizer_is_the_default():
     assert not args.muon_split_qkv
     assert not args.muon_split_swiglu
     assert args.soap_fallback_lr == 3e-4
+    assert args.soap_precondition_frequency_after_warmup == 0
+    assert args.soap_precondition_frequency_warmup_steps == 0
+    assert args.soap_residual_threshold == 0.0
+    assert args.soap_residual_max_age == 40
+    assert args.soap_residual_warmup_steps == 0
+    assert args.soap_reset_max_age == 0
     assert args.muon_retract_steps == 1
     assert args.muon_retract_method == "higham_cubic"
     assert args.muon_spectral_cap_mode == "gershgorin"
@@ -324,4 +330,30 @@ def test_optimizer_diagnostics_reports_step_only_power_statistics():
         "mean_probe_top_singular": 2.0,
         "mean_transport_step_scale": pytest.approx(0.3),
         "minimum_transport_step_scale": pytest.approx(0.2),
+    }
+
+
+def test_optimizer_diagnostics_reports_soap_residual_gate():
+    parameter = torch.nn.Parameter(torch.zeros(2, 2))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    optimizer.state[parameter].update(
+        {
+            "basis_residual_checks": 4,
+            "basis_residual_skips": 2,
+            "basis_residual_threshold_refreshes": 1,
+            "basis_residual_max_age_refreshes": 1,
+            "basis_residual_ratio_sum": 0.4,
+            "basis_residual_ratio_max": 0.25,
+        }
+    )
+
+    gate = optimizer_diagnostics(optimizer)["basis_residual_gate"]
+
+    assert gate == {
+        "checks": 4,
+        "skips": 2,
+        "threshold_refreshes": 1,
+        "max_age_refreshes": 1,
+        "mean_checked_residual": pytest.approx(0.1),
+        "maximum_checked_residual": pytest.approx(0.25),
     }

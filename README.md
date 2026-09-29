@@ -175,7 +175,9 @@ optimizer.zero_grad(set_to_none=True)
 - `muon_warm_separate_skew_signal`: with check-only cadence, return raw skew and
   alignment terms from one consistent compiled direction path and reduce them
   only before useful checks. This avoids both an extra Gram product and the
-  rejected alternating direction kernels. It is experimental and requires
+  rejected alternating direction kernels. At equal step count it trades a small
+  loss increase for higher throughput; at matched wall time the extra steps
+  improve three-seed mean validation loss. It requires
   `muon_warm_signal_check_only=True`; default: `False`.
   `state["muon_warm_anchor_reason"]` records `initial`, `state_reset`, `warmup`,
   `schedule`, `max_age`, `rejection_streak`, `tracking_error`, `alignment`,
@@ -711,11 +713,27 @@ That follow-up is now implemented behind
 raw skew and alignment intermediates on every warm step; only the useful
 period-four check reduces them to an FP32 scalar. This keeps one direction
 kernel and does not rebuild the Gram product. At `768x768` and `768x2048`, its
-exact warm-cycle savings are 13.4% and 12.6%. The first 1,000-step seed saves
-16.6% optimizer time and 3.0% total step time, but ends at `4.24671` versus
-`4.23989` for the retained control. Seeds 456 and 789 remain required before a
-decision; the current aggregate is
+exact warm-cycle savings are 13.4% and 12.6%. Across three matched 1,000-step
+seeds, mean optimizer time falls from `40.65` to `33.44` ms (17.7%), total step
+time falls from `171.27` to `164.93` ms (3.7%), and throughput rises 3.8%.
+Validation loss is worse on all three paired seeds and rises from `4.23854` to
+`4.24322` (`+0.00468` mean). It therefore remains an opt-in throughput tradeoff
+rather than the quality-neutral default. The complete aggregate is
 `../optimizer_replay_results/transport_skew_signal_terms_cadence_768_summary.json`.
+
+A matched-wall-clock follow-up gives the faster profile 1,038 steps versus
+1,000 for the retained controller. Mean end-to-end time is `181.61` versus
+`181.92` seconds (`-0.17%`), while validation improves on every seed and falls
+from `4.23854` to `4.21781` (`-0.02073`). Raw-term cadence therefore advances
+as the wall-clock throughput profile, while every-warm evaluation remains the
+conservative fixed-token profile. The aggregate is
+`../optimizer_replay_results/transport_skew_signal_terms_wallclock_768_summary.json`.
+
+A full-horizon seed-123 threshold screen does not repair the equal-step gap.
+Raw-term thresholds `0.50`, `0.52`, and `0.54` finish at `4.25345`, `4.24671`,
+and `4.25587`, with 2,920, 2,385, and 1,854 adaptive anchors. Threshold `0.52`
+is retained; neither neighboring setting merits replication. Results are in
+`../optimizer_replay_results/transport_skew_signal_terms_threshold_screen_768_summary.json`.
 
 Long runs support atomic rolling checkpoints with exact shuffled-data position,
 model, optimizer, scheduler, and RNG state:
