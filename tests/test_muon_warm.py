@@ -361,6 +361,8 @@ def test_power_step_cap_preserves_unaffected_singular_directions():
         probe_sigma,
         step_scale,
         _,
+        _,
+        _,
     ) = muon_warm._row_ns_retract_power_step_cap(
         q_previous,
         correction,
@@ -383,6 +385,28 @@ def test_power_step_cap_preserves_unaffected_singular_directions():
     assert step_scale < 0.01
     assert final_scale == 1.0
     assert step_error < 0.1 * whole_error
+
+
+def test_adaptive_power_refines_only_when_first_direction_is_uncertain():
+    gram = torch.tensor(
+        [[1.0, 0.8, 0.0], [0.8, 1.0, 0.0], [0.0, 0.0, 0.25]],
+        dtype=torch.bfloat16,
+    )
+
+    refined = muon_warm._power_spectral_cap_adaptive(
+        gram, None, 2, 1.25, 0.01
+    )
+    kept = muon_warm._power_spectral_cap_adaptive(
+        gram, None, 2, 1.25, 0.5
+    )
+    fixed_one = muon_warm._power_spectral_cap(gram, None, 1, 1.25)
+    fixed_two = muon_warm._power_spectral_cap(gram, None, 2, 1.25)
+
+    assert refined[4] == 1.0
+    assert kept[4] == 0.0
+    assert refined[5] > 0.01
+    assert torch.equal(refined[1], fixed_two[1])
+    assert torch.equal(kept[1], fixed_one[1])
 
 
 def test_optimizer_records_power_step_scale(monkeypatch):
@@ -740,6 +764,379 @@ def test_power_step_skew_ratio_gate_uses_lightweight_lazy_path(monkeypatch):
     assert torch.equal(state["muon_warm_q"], q_cache)
     assert torch.equal(update, q_output)
     assert state["muon_warm_skew_ratio_signal_tensor"] == 0.25
+
+
+def test_skew_signal_is_only_evaluated_when_next_check_consumes_it(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=8,
+        muon_warm_full_ns_steps=0,
+        muon_warm_retract_steps=0,
+        muon_warm_spectral_cap_mode="power_step",
+        muon_warm_legacy_retraction_output=True,
+        muon_warm_max_skew_ratio=0.1,
+        muon_warm_check_every=4,
+        muon_warm_signal_check_only=True,
+    )
+    q_previous = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1).to(
+        torch.bfloat16
+    )
+    state = {
+        "step": 1,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": q_previous.clone(),
+        "muon_warm_age": 0,
+    }
+    calls = []
+
+    def fake_legacy(*args):
+        calls.append("legacy")
+        scalar = q_previous.new_tensor(1.0, dtype=torch.float32)
+        return (
+            q_previous,
+            q_previous,
+            torch.ones(4, dtype=q_previous.dtype),
+            scalar,
+            scalar,
+            scalar,
+            scalar,
+        )
+
+    def fake_skew(*args):
+        calls.append("skew")
+        scalar = q_previous.new_tensor(1.0, dtype=torch.float32)
+        return (
+            q_previous,
+            q_previous,
+            scalar.new_tensor(0.25),
+            torch.ones(4, dtype=q_previous.dtype),
+            scalar,
+            scalar,
+            scalar,
+            scalar,
+        )
+
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_polar_jacobi_step_power_step_cap_with_legacy_output_no_cache_retract",
+        fake_legacy,
+    )
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_polar_jacobi_step_power_step_cap_with_skew_ratio_signal_no_cache_retract",
+        fake_skew,
+    )
+
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+    assert calls == ["legacy"]
+    assert "muon_warm_skew_ratio_signal_tensor" not in state
+    assert "muon_warm_skew_ratio_signal_evaluations" not in state
+
+    state["step"] = 3
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+    assert calls == ["legacy", "skew"]
+    assert state["muon_warm_skew_ratio_signal_tensor"] == 0.25
+    assert state["muon_warm_skew_ratio_signal_evaluations"] == 1
+
+    # Step eight is already a fixed anchor, so measuring a step-seven signal
+    # cannot affect the next update and is skipped as well.
+    state["step"] = 7
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+    assert calls == ["legacy", "skew", "legacy"]
+    assert state["muon_warm_skew_ratio_signal_evaluations"] == 1
+
+
+def test_skew_signal_cadence_is_opt_in(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=8,
+        muon_warm_full_ns_steps=0,
+        muon_warm_retract_steps=0,
+        muon_warm_spectral_cap_mode="power_step",
+        muon_warm_legacy_retraction_output=True,
+        muon_warm_max_skew_ratio=0.1,
+        muon_warm_check_every=4,
+    )
+    q_previous = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1).to(
+        torch.bfloat16
+    )
+    state = {
+        "step": 1,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": q_previous.clone(),
+        "muon_warm_age": 0,
+    }
+    calls = []
+
+    def fake_skew(*args):
+        calls.append("skew")
+        scalar = q_previous.new_tensor(1.0, dtype=torch.float32)
+        return (
+            q_previous,
+            q_previous,
+            scalar.new_tensor(0.25),
+            torch.ones(4, dtype=q_previous.dtype),
+            scalar,
+            scalar,
+            scalar,
+            scalar,
+        )
+
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_polar_jacobi_step_power_step_cap_with_skew_ratio_signal_no_cache_retract",
+        fake_skew,
+    )
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+
+    assert calls == ["skew"]
+    assert state["muon_warm_skew_ratio_signal_evaluations"] == 1
+
+
+def test_separate_skew_signal_uses_one_direction_path(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=8,
+        muon_warm_full_ns_steps=0,
+        muon_warm_retract_steps=0,
+        muon_warm_spectral_cap_mode="power_step",
+        muon_warm_legacy_retraction_output=True,
+        muon_warm_max_skew_ratio=0.1,
+        muon_warm_check_every=4,
+        muon_warm_signal_check_only=True,
+        muon_warm_separate_skew_signal=True,
+    )
+    q_previous = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1).to(
+        torch.bfloat16
+    )
+    state = {
+        "step": 1,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": q_previous.clone(),
+        "muon_warm_age": 0,
+    }
+    calls = []
+
+    def fake_terms(*args):
+        calls.append("direction")
+        scalar = q_previous.new_tensor(1.0, dtype=torch.float32)
+        square = torch.eye(4, dtype=q_previous.dtype)
+        return (
+            q_previous,
+            q_previous,
+            square,
+            square,
+            torch.ones(4, dtype=q_previous.dtype),
+            scalar,
+            scalar,
+            scalar,
+            scalar,
+        )
+
+    def fake_reduction(*args):
+        calls.append("reduction")
+        return q_previous.new_tensor(0.25, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_polar_jacobi_step_power_step_cap_with_skew_terms_no_cache_retract",
+        fake_terms,
+    )
+    monkeypatch.setattr(muon_warm, "_skew_ratio_from_terms", fake_reduction)
+
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+    assert calls == ["direction"]
+    assert "muon_warm_skew_ratio_signal_tensor" not in state
+
+    state["step"] = 3
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+    assert calls == ["direction", "direction", "reduction"]
+    assert state["muon_warm_skew_ratio_signal_tensor"] == 0.25
+    assert state["muon_warm_skew_ratio_signal_evaluations"] == 1
+
+    state["step"] = 7
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+    assert calls == ["direction", "direction", "reduction", "direction"]
+    assert state["muon_warm_skew_ratio_signal_evaluations"] == 1
+
+
+def test_signal_free_and_skew_measured_paths_emit_identical_directions():
+    torch.manual_seed(31)
+    q_previous = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1).to(
+        torch.bfloat16
+    )
+    work_matrix = torch.randn(4, 8).to(torch.bfloat16)
+    common = (
+        work_matrix,
+        q_previous,
+        1.0,
+        1e-3,
+        "higham_cubic",
+        0,
+        True,
+        None,
+        "tikhonov",
+    )
+    legacy = _eager(
+        muon_warm._warm_polar_jacobi_step_power_step_cap_with_legacy_output_no_cache_retract
+    )(*common, None, 1, 1.05, 1.0, 1.0, 4.0)
+    measured = _eager(
+        muon_warm._warm_polar_jacobi_step_power_step_cap_with_skew_ratio_signal_no_cache_retract
+    )(*common, None, 1, 1.05, True, 1.0, 1.0, 4.0)
+
+    assert torch.equal(legacy[0], measured[0])
+    assert torch.equal(legacy[1], measured[1])
+    for legacy_value, measured_value in zip(legacy[2:], measured[3:]):
+        assert torch.equal(legacy_value, measured_value)
+
+
+def test_raw_skew_terms_reproduce_combined_signal_and_direction():
+    torch.manual_seed(37)
+    q_previous = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1).to(
+        torch.bfloat16
+    )
+    work_matrix = torch.randn(4, 8).to(torch.bfloat16)
+    common = (
+        work_matrix,
+        q_previous,
+        1.0,
+        1e-3,
+        "higham_cubic",
+        0,
+        True,
+        None,
+        "tikhonov",
+    )
+    measured = _eager(
+        muon_warm._warm_polar_jacobi_step_power_step_cap_with_skew_ratio_signal_no_cache_retract
+    )(*common, None, 1, 1.05, True, 1.0, 1.0, 4.0)
+    terms = _eager(
+        muon_warm._warm_polar_jacobi_step_power_step_cap_with_skew_terms_no_cache_retract
+    )(*common, None, 1, 1.05, True, 1.0, 1.0, 4.0)
+    signal = _eager(muon_warm._skew_ratio_from_terms)(terms[2], terms[3])
+
+    assert torch.equal(terms[0], measured[0])
+    assert torch.equal(terms[1], measured[1])
+    assert signal == measured[2]
+    for terms_value, measured_value in zip(terms[4:], measured[3:]):
+        assert torch.equal(terms_value, measured_value)
+
+def test_adaptive_power_skew_path_records_device_side_refinement(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    optimizer = muon_warm.MuonWarm(
+        [{"params": [parameter], "use_muon": True}],
+        muon_momentum=0.0,
+        muon_nesterov=False,
+        muon_warm_anchor_every=0,
+        muon_warm_full_ns_steps=0,
+        muon_warm_retract_steps=0,
+        muon_warm_spectral_cap_mode="power_step",
+        muon_warm_power_steps=2,
+        muon_warm_power_refine_threshold=0.02,
+        muon_warm_legacy_retraction_output=True,
+        muon_warm_max_skew_ratio=0.52,
+    )
+    q_previous = torch.cat((torch.eye(4), torch.zeros(4, 4)), dim=1).to(
+        torch.bfloat16
+    )
+    state = {
+        "step": 2,
+        "momentum_fast": torch.zeros_like(parameter),
+        "muon_warm_q": q_previous.clone(),
+        "muon_warm_age": 0,
+    }
+    called = []
+
+    def fake_adaptive(*args):
+        called.append(args)
+        scalar = q_previous.new_tensor(1.0, dtype=torch.float32)
+        return (
+            q_previous,
+            q_previous,
+            scalar.new_tensor(0.1),
+            torch.ones(4, dtype=q_previous.dtype),
+            scalar,
+            scalar,
+            scalar,
+            scalar,
+            scalar,
+            scalar.new_tensor(0.125),
+        )
+
+    monkeypatch.setattr(
+        muon_warm,
+        "_warm_polar_jacobi_step_power_step_cap_with_adaptive_power_skew_ratio_signal_no_cache_retract",
+        fake_adaptive,
+    )
+
+    optimizer._muon_update_warm(
+        torch.randn_like(parameter), state, optimizer.param_groups[0]
+    )
+
+    assert len(called) == 1
+    assert called[0][12] == 0.02
+    assert state["muon_warm_power_refinement_samples"] == 1
+    assert state["muon_warm_power_refinement_sum_tensor"] == 1.0
+    assert state["muon_warm_power_uncertainty_sum_tensor"] == 0.125
+
+
+def test_adaptive_power_requires_supported_lightweight_skew_configuration():
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    common = {
+        "params": [{"params": [parameter], "use_muon": True}],
+        "muon_warm_spectral_cap_mode": "power_step",
+        "muon_warm_power_steps": 2,
+        "muon_warm_power_refine_threshold": 0.02,
+    }
+    with pytest.raises(ValueError, match="max_skew_ratio"):
+        muon_warm.MuonWarm(**common)
+    with pytest.raises(ValueError, match="lightweight"):
+        muon_warm.MuonWarm(
+            **common,
+            muon_warm_max_skew_ratio=0.52,
+            muon_warm_record_stats=True,
+        )
+
+
+def test_separate_skew_signal_requires_check_only_lightweight_controller():
+    parameter = torch.nn.Parameter(torch.zeros(4, 8))
+    common = {
+        "params": [{"params": [parameter], "use_muon": True}],
+        "muon_warm_spectral_cap_mode": "power_step",
+        "muon_warm_max_skew_ratio": 0.52,
+        "muon_warm_separate_skew_signal": True,
+    }
+    with pytest.raises(ValueError, match="signal_check_only"):
+        muon_warm.MuonWarm(**common)
+    with pytest.raises(ValueError, match="lightweight"):
+        muon_warm.MuonWarm(
+            **common,
+            muon_warm_signal_check_only=True,
+            muon_warm_record_stats=True,
+        )
 
 
 def test_legacy_retraction_oracle_requires_power_step_mode():

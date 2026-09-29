@@ -452,6 +452,7 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace, device: torch.de
             muon_warm_full_ns_steps=args.muon_full_ns_steps,
             muon_warm_retract_steps=args.muon_retract_steps,
             muon_warm_retract_every=args.muon_retract_every,
+            muon_warm_retract_method=args.muon_retract_method,
             muon_warm_jacobi_damping=args.muon_jacobi_damping,
             muon_warm_max_tangent_rms=args.muon_max_tangent_rms,
             muon_warm_record_stats=args.muon_record_stats,
@@ -460,6 +461,8 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace, device: torch.de
             muon_warm_normal_inv_ema_beta=args.muon_normal_inv_ema_beta,
             muon_warm_max_angular_rms=args.muon_max_angular_rms,
             muon_warm_max_skew_ratio=args.muon_max_skew_ratio,
+            muon_warm_signal_check_only=args.muon_signal_check_only,
+            muon_warm_separate_skew_signal=args.muon_separate_skew_signal,
             muon_warm_async_checks=args.muon_async_checks,
             muon_warm_update_stats_every=args.muon_update_stats_every,
             muon_warm_reference_lr_ratio=(
@@ -475,6 +478,7 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace, device: torch.de
             muon_warm_spectral_cap_mode=args.muon_spectral_cap_mode,
             muon_warm_power_steps=args.muon_power_steps,
             muon_warm_power_safety_factor=args.muon_power_safety_factor,
+            muon_warm_power_refine_threshold=args.muon_power_refine_threshold,
         )
     if args.optimizer == "soap":
         if not HAS_TURBO_SOAP:
@@ -517,6 +521,8 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
     anchors = Counter()
     angular_checks = 0
     skew_ratio_checks = 0
+    angular_signal_evaluations = 0
+    skew_ratio_signal_evaluations = 0
     async_checks_submitted = async_checks_completed = 0
     async_enqueue_skips = async_stale_checks = 0
     warm_steps = warm_retractions = output_retractions = 0
@@ -533,6 +539,9 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
     power_step_samples = 0
     power_probe_sigma_sum = power_step_scale_sum = 0.0
     power_step_min_scale = 1.0
+    power_refinement_samples = 0
+    power_refinement_sum = power_uncertainty_sum = 0.0
+    power_uncertainty_max = 0.0
     controller_samples = alignment_condition_samples = 0
     controller_sums: dict[str, float] = Counter()
     controller_maxima: dict[str, float] = {}
@@ -585,6 +594,12 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
         angular_checks += int(state.get("muon_warm_angular_checks", 0))
         skew_ratio_checks += int(
             state.get("muon_warm_skew_ratio_checks", 0)
+        )
+        angular_signal_evaluations += int(
+            state.get("muon_warm_angular_signal_evaluations", 0)
+        )
+        skew_ratio_signal_evaluations += int(
+            state.get("muon_warm_skew_ratio_signal_evaluations", 0)
         )
         async_checks_submitted += int(
             state.get("muon_warm_async_checks_submitted", 0)
@@ -645,6 +660,21 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
             power_step_min_scale = min(
                 power_step_min_scale,
                 float(state["muon_warm_spectral_step_min_scale_tensor"]),
+            )
+        state_refinement_samples = int(
+            state.get("muon_warm_power_refinement_samples", 0)
+        )
+        if state_refinement_samples > 0:
+            power_refinement_samples += state_refinement_samples
+            power_refinement_sum += float(
+                state["muon_warm_power_refinement_sum_tensor"]
+            )
+            power_uncertainty_sum += float(
+                state["muon_warm_power_uncertainty_sum_tensor"]
+            )
+            power_uncertainty_max = max(
+                power_uncertainty_max,
+                float(state["muon_warm_power_uncertainty_max_tensor"]),
             )
         state_controller_samples = int(
             state.get("muon_warm_controller_samples", 0)
@@ -772,6 +802,8 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
         "anchor_counts": dict(sorted(anchors.items())),
         "angular_checks": angular_checks,
         "skew_ratio_checks": skew_ratio_checks,
+        "angular_signal_evaluations": angular_signal_evaluations,
+        "skew_ratio_signal_evaluations": skew_ratio_signal_evaluations,
         "async_drift_checks": {
             "submitted": async_checks_submitted,
             "completed": async_checks_completed,
@@ -842,6 +874,20 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
                         power_step_scale_sum / power_step_samples
                     ),
                     "minimum_transport_step_scale": power_step_min_scale,
+                }
+            )
+        if power_refinement_samples > 0:
+            power_cap_stats.update(
+                {
+                    "adaptive_power_samples": power_refinement_samples,
+                    "adaptive_power_refinements": power_refinement_sum,
+                    "adaptive_power_refinement_fraction": (
+                        power_refinement_sum / power_refinement_samples
+                    ),
+                    "mean_power_uncertainty": (
+                        power_uncertainty_sum / power_refinement_samples
+                    ),
+                    "maximum_power_uncertainty": power_uncertainty_max,
                 }
             )
         diagnostics["power_cap_stats"] = power_cap_stats
@@ -1821,6 +1867,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--muon-full-ns-steps", type=int, default=0)
     parser.add_argument("--muon-retract-steps", type=int, default=1)
     parser.add_argument("--muon-retract-every", type=int, default=1)
+    parser.add_argument(
+        "--muon-retract-method",
+        choices=("higham_cubic", "quadratic"),
+        default="higham_cubic",
+    )
     parser.add_argument("--muon-jacobi-damping", choices=("floor", "tikhonov"), default="tikhonov")
     parser.add_argument("--muon-max-tangent-rms", type=float, default=0.0)
     parser.add_argument("--muon-record-stats", action=argparse.BooleanOptionalAction, default=False)
@@ -1829,6 +1880,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--muon-normal-inv-ema-beta", type=float, default=0.95)
     parser.add_argument("--muon-max-angular-rms", type=float, default=0.0)
     parser.add_argument("--muon-max-skew-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--muon-signal-check-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--muon-separate-skew-signal",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--muon-async-checks",
         action=argparse.BooleanOptionalAction,
@@ -1844,6 +1905,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--muon-spectral-cap-mode", choices=("gershgorin", "power", "power_step"), default="gershgorin")
     parser.add_argument("--muon-power-steps", type=int, default=2)
     parser.add_argument("--muon-power-safety-factor", type=float, default=1.25)
+    parser.add_argument("--muon-power-refine-threshold", type=float, default=0.0)
     parser.add_argument("--muon-large-tensor-threshold", type=int, default=16_384)
 
     parser.add_argument("--soap-shampoo-beta", type=float, default=0.999)

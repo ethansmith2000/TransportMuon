@@ -22,10 +22,13 @@ if "muon" not in sys.modules:
 from muon_warm import (  # noqa: E402
     _muon_ns5_prepared,
     _row_ns_retract,
+    _skew_ratio_from_terms,
     _warm_polar_jacobi_step_power_step_cap,
+    _warm_polar_jacobi_step_power_step_cap_with_adaptive_power_skew_ratio_signal_no_cache_retract,
     _warm_polar_jacobi_step_power_step_cap_with_angular_signal_no_cache_retract,
     _warm_polar_jacobi_step_power_step_cap_with_legacy_output_no_cache_retract,
     _warm_polar_jacobi_step_power_step_cap_with_skew_ratio_signal_no_cache_retract,
+    _warm_polar_jacobi_step_power_step_cap_with_skew_terms_no_cache_retract,
 )
 
 
@@ -94,6 +97,13 @@ def main() -> None:
     parser.add_argument("--drift", type=float, default=0.08)
     parser.add_argument("--power-safety-factor", type=float, default=1.05)
     parser.add_argument("--normal-inv-cap", type=float, default=4.0)
+    parser.add_argument(
+        "--power-refine-threshold",
+        action="append",
+        type=float,
+        dest="power_refine_thresholds",
+        help="adaptive second-power direction-change threshold, repeatable",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--output", type=Path)
@@ -102,6 +112,9 @@ def main() -> None:
         raise ValueError("repetitions must be positive")
     if args.drift < 0.0:
         raise ValueError("drift must be non-negative")
+    power_refine_thresholds = args.power_refine_thresholds or [0.01, 0.02, 0.05]
+    if any(value <= 0.0 for value in power_refine_thresholds):
+        raise ValueError("power refine thresholds must be positive")
 
     shapes = args.shapes or [(768, 768), (768, 2048)]
     device = torch.device(args.device)
@@ -132,6 +145,7 @@ def main() -> None:
             None,
             "tikhonov",
         )
+        quadratic_common = (*common[:4], "quadratic", *common[5:])
         # Prime a stable probe vector once, then feed the same cached vector to
         # every timed call. This models an ordinary warm optimizer step without
         # mixing Python state mutation into the measurement.
@@ -176,6 +190,17 @@ def main() -> None:
                 args.normal_inv_cap,
             )
 
+        def warm_output_quadratic(power_steps: int = 1):
+            return _warm_polar_jacobi_step_power_step_cap_with_legacy_output_no_cache_retract(
+                *quadratic_common,
+                power_vector,
+                power_steps,
+                args.power_safety_factor,
+                1.0,
+                1.0,
+                args.normal_inv_cap,
+            )
+
         def warm_angular():
             return _warm_polar_jacobi_step_power_step_cap_with_angular_signal_no_cache_retract(
                 *common,
@@ -188,12 +213,41 @@ def main() -> None:
                 args.normal_inv_cap,
             )
 
-        def warm_skew():
+        def warm_skew(power_steps: int = 2, quadratic: bool = False):
             return _warm_polar_jacobi_step_power_step_cap_with_skew_ratio_signal_no_cache_retract(
+                *(quadratic_common if quadratic else common),
+                power_vector,
+                power_steps,
+                args.power_safety_factor,
+                True,
+                1.0,
+                1.0,
+                args.normal_inv_cap,
+            )
+
+        def warm_skew_terms(power_steps: int = 1):
+            return _warm_polar_jacobi_step_power_step_cap_with_skew_terms_no_cache_retract(
+                *common,
+                power_vector,
+                power_steps,
+                args.power_safety_factor,
+                True,
+                1.0,
+                1.0,
+                args.normal_inv_cap,
+            )
+
+        def reduce_skew_terms():
+            result = warm_skew_terms()
+            return _skew_ratio_from_terms(result[2], result[3])
+
+        def warm_adaptive(threshold: float):
+            return _warm_polar_jacobi_step_power_step_cap_with_adaptive_power_skew_ratio_signal_no_cache_retract(
                 *common,
                 power_vector,
                 2,
                 args.power_safety_factor,
+                threshold,
                 True,
                 1.0,
                 1.0,
@@ -205,17 +259,92 @@ def main() -> None:
             "warm_geometry_power2": warm_geometry,
             "warm_output_power2": warm_output,
             "warm_output_power1": lambda: warm_output(1),
+            "warm_output_power1_quadratic": warm_output_quadratic,
             "warm_angular_signal": warm_angular,
             "warm_skew_signal": warm_skew,
+            "warm_skew_power1": lambda: warm_skew(1),
+            "warm_skew_terms_power1": warm_skew_terms,
+            "warm_skew_terms_power1_with_reduction": reduce_skew_terms,
+            "warm_skew_power1_quadratic": lambda: warm_skew(1, True),
         }
+        variants.update(
+            {
+                f"warm_skew_adaptive_{threshold:g}": (
+                    lambda threshold=threshold: warm_adaptive(threshold)
+                )
+                for threshold in power_refine_thresholds
+            }
+        )
         timings = {
             name: _elapsed_ms(function, args.repetitions, device)
             for name, function in variants.items()
         }
+
+        def warm_skew_power1_period4_cycle():
+            # The retained controller checks every fourth optimizer step. Three
+            # signal-free calls followed by one measured call reproduce the
+            # optimized cadence without mixing model/trainer work into this
+            # component benchmark.
+            warm_output(1)
+            warm_output(1)
+            warm_output(1)
+            return warm_skew(1)
+
+        timings["warm_skew_power1_check_every4_amortized"] = (
+            _elapsed_ms(
+                warm_skew_power1_period4_cycle,
+                args.repetitions,
+                device,
+            )
+            / 4.0
+        )
+
+        def warm_skew_power1_anchor8_check4_cycle():
+            # A period-eight scheduled anchor makes the step-seven signal
+            # irrelevant. Among the seven warm steps, only step three needs the
+            # skew measurement that feeds the step-four controller check.
+            for _ in range(6):
+                warm_output(1)
+            return warm_skew(1)
+
+        timings["warm_skew_power1_anchor8_check4_amortized"] = (
+            _elapsed_ms(
+                warm_skew_power1_anchor8_check4_cycle,
+                args.repetitions,
+                device,
+            )
+            / 7.0
+        )
+
+        def warm_skew_terms_power1_anchor8_check4_cycle():
+            # The raw-term direction graph is identical for all seven warm
+            # steps. Only step three reduces its returned terms to a scalar.
+            for index in range(7):
+                result = warm_skew_terms()
+                if index == 2:
+                    _skew_ratio_from_terms(result[2], result[3])
+            return result
+
+        timings[
+            "warm_skew_terms_power1_anchor8_check4_amortized"
+        ] = (
+            _elapsed_ms(
+                warm_skew_terms_power1_anchor8_check4_cycle,
+                args.repetitions,
+                device,
+            )
+            / 7.0
+        )
         reference_output = warm_output(2)[1]
         power1_output = warm_output(1)[1]
+        quadratic_output = warm_output_quadratic()[1]
         angular_output = warm_angular()[1]
         skew_output = warm_skew()[1]
+        skew_terms_output = warm_skew_terms()[1]
+        adaptive_outputs = {
+            f"{threshold:g}": warm_adaptive(threshold)
+            for threshold in power_refine_thresholds
+        }
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
@@ -235,12 +364,29 @@ def main() -> None:
             "power1_output_metrics": _direction_metrics(
                 power1_output, reference_output
             ),
+            "power1_quadratic_output_metrics": _direction_metrics(
+                quadratic_output, reference_output
+            ),
             "angular_output_metrics": _direction_metrics(
                 angular_output, reference_output
             ),
             "skew_output_metrics": _direction_metrics(skew_output, reference_output),
+            "skew_terms_output_metrics": _direction_metrics(
+                skew_terms_output, reference_output
+            ),
             "angular_signal": float(warm_angular()[2]),
             "skew_ratio_signal": float(warm_skew()[2]),
+            "skew_terms_ratio_signal": float(reduce_skew_terms()),
+            "adaptive_power": {
+                threshold: {
+                    "output_metrics": _direction_metrics(
+                        output[1], reference_output
+                    ),
+                    "refined": bool(output[8]),
+                    "uncertainty": float(output[9]),
+                }
+                for threshold, output in adaptive_outputs.items()
+            },
         }
         records.append(record)
         print(json.dumps(record, sort_keys=True), flush=True)

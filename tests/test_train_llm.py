@@ -36,9 +36,11 @@ def test_local_optimizer_is_the_default():
     assert not args.muon_split_swiglu
     assert args.soap_fallback_lr == 3e-4
     assert args.muon_retract_steps == 1
+    assert args.muon_retract_method == "higham_cubic"
     assert args.muon_spectral_cap_mode == "gershgorin"
     assert args.muon_power_steps == 2
     assert args.muon_power_safety_factor == 1.25
+    assert args.muon_power_refine_threshold == 0.0
     assert not args.muon_async_checks
     assert not args.hf_streaming
     assert args.checkpoint_every == 0
@@ -211,6 +213,8 @@ def test_optimizer_diagnostics_summarizes_muon_reference_statistics():
             "muon_reference_samples": 1,
             "muon_warm_q": torch.eye(2),
             "muon_warm_output_retractions": 7,
+            "muon_warm_angular_signal_evaluations": 3,
+            "muon_warm_skew_ratio_signal_evaluations": 5,
             "muon_warm_power_cap_samples": 2,
             "muon_warm_power_sigma_sum_tensor": torch.tensor(2.2),
             "muon_warm_spectral_cap_scale_sum_tensor": torch.tensor(1.8),
@@ -219,6 +223,10 @@ def test_optimizer_diagnostics_summarizes_muon_reference_statistics():
             "muon_warm_power_probe_sigma_sum_tensor": torch.tensor(4.0),
             "muon_warm_spectral_step_scale_sum_tensor": torch.tensor(0.6),
             "muon_warm_spectral_step_min_scale_tensor": torch.tensor(0.2),
+            "muon_warm_power_refinement_samples": 2,
+            "muon_warm_power_refinement_sum_tensor": torch.tensor(1.0),
+            "muon_warm_power_uncertainty_sum_tensor": torch.tensor(0.25),
+            "muon_warm_power_uncertainty_max_tensor": torch.tensor(0.2),
             "muon_update_stats_by_age": {
                 3: {
                     "direction_sq_sum_tensor": torch.tensor(4.0),
@@ -285,7 +293,16 @@ def test_optimizer_diagnostics_summarizes_muon_reference_statistics():
     assert diagnostics["power_cap_stats"]["mean_probe_top_singular"] == 2.0
     assert diagnostics["power_cap_stats"]["mean_transport_step_scale"] == pytest.approx(0.3)
     assert diagnostics["power_cap_stats"]["minimum_transport_step_scale"] == pytest.approx(0.2)
+    assert diagnostics["power_cap_stats"]["adaptive_power_samples"] == 2
+    assert diagnostics["power_cap_stats"]["adaptive_power_refinements"] == 1.0
+    assert diagnostics["power_cap_stats"][
+        "adaptive_power_refinement_fraction"
+    ] == 0.5
+    assert diagnostics["power_cap_stats"]["mean_power_uncertainty"] == pytest.approx(0.125)
+    assert diagnostics["power_cap_stats"]["maximum_power_uncertainty"] == pytest.approx(0.2)
     assert diagnostics["output_retractions"] == 7
+    assert diagnostics["angular_signal_evaluations"] == 3
+    assert diagnostics["skew_ratio_signal_evaluations"] == 5
 
 
 def test_optimizer_diagnostics_reports_step_only_power_statistics():

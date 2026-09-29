@@ -103,6 +103,11 @@ optimizer.zero_grad(set_to_none=True)
 - `muon_warm_power_safety_factor`: multiplier on the estimated top singular
   value before clipping to the retraction limit. Default: `1.25`. Smaller
   factors preserve more magnitude but can underestimate abrupt rotations.
+- `muon_warm_power_refine_threshold`: experimental device-side uncertainty
+  threshold for conditionally running the remaining power iterations. `0`
+  disables it. The width-768 component benchmark found that `torch.cond`
+  increased the complete skew path by about 21% even when the second iteration
+  never ran, so this is retained only to reproduce that rejected experiment.
 - `muon_warm_anchor_retract_method`: retraction used after full NS anchors.
   Default: `"higham_cubic"`, independent of the warm-step method.
 - `muon_warm_anchor_retract_steps`: polishing iterations after a full anchor.
@@ -161,6 +166,17 @@ optimizer.zero_grad(set_to_none=True)
   `muon_warm_alignment_tolerance`; `0` disables it. The streak stays on-device
   between amortized checks.
 - `muon_warm_check_every`: interval for adaptive tracking checks. Default: `1`.
+  Diagnostics distinguish signal evaluations from checks.
+- `muon_warm_signal_check_only`: opt-in rejected throughput experiment. It
+  evaluates an angular/skew signal only on the warm step whose value the next
+  check consumes and omits checks before a fixed scheduled anchor. This saves
+  about 16% optimizer time at the target shape, but regressed three-seed mean
+  validation loss by `0.00555`; default: `False`.
+- `muon_warm_separate_skew_signal`: with check-only cadence, return raw skew and
+  alignment terms from one consistent compiled direction path and reduce them
+  only before useful checks. This avoids both an extra Gram product and the
+  rejected alternating direction kernels. It is experimental and requires
+  `muon_warm_signal_check_only=True`; default: `False`.
   `state["muon_warm_anchor_reason"]` records `initial`, `state_reset`, `warmup`,
   `schedule`, `max_age`, `rejection_streak`, `tracking_error`, `alignment`,
   `stretch`, `angular_rms`, `skew_ratio`, or `warm`.
@@ -261,10 +277,14 @@ optimizer.zero_grad(set_to_none=True)
 - Use a small non-negative `muon_warm_alignment_tolerance` as a safety valve;
   pair it with periodic adaptive-anchor checks so repeated rejected steps cause
   a fresh solve instead of leaving a stale direction indefinitely.
-- A useful experiment is `muon_warm_retract_method="quadratic"` with one warm
-  step while retaining the default two cubic anchor polishes. The quadratic
-  warm path was roughly 17--22% faster in the included microbenchmark; its
-  training stability still needs measurement.
+- `muon_warm_retract_method="quadratic"` remains an attribution control while
+  full anchors keep their two cubic polishes. At the target `768x768` and
+  `768x2048` logical shapes it cut the complete skew warm path by 7--8%, but
+  contracted emitted update RMS to about `0.91` of cubic. Multiplying warm
+  outputs by `1.1` repaired the magnitude and passed the three-seed 200-step
+  screen, then regressed both matched 1,000-step seeds by `0.00887` loss on
+  average for only a 2.1% optimizer-time saving. Keep `higham_cubic` as the
+  training default.
 - Retractions evaluate their polynomials in residual form around `G = I`. This
   is algebraically unchanged but avoids BF16 cancellation when the candidate is
   already close to orthogonal. Full anchors also skip the loose Gershgorin cap:
@@ -659,6 +679,43 @@ power iteration as the next-scale efficiency candidate while retaining the
 two-power profile as its numerical control. The complete curves and raw source
 paths are in
 `../optimizer_replay_results/llm_openwebtext_modern_768x8_1000step_three_seed_summary.json`.
+
+Two follow-up attempts targeted the remaining warm-path cost. A conditional
+second power iteration was rejected at the component stage: thresholds
+`0.01`, `0.02`, and `0.05` requested no refinement on the prepared drift-0.50
+matrices, yet the device-side branch raised complete skew-path time by 21--22%.
+A quadratic output retraction was more promising in isolation, reducing that
+path by 7--8%. Its approximately 9% contraction was compensated with a warm-only
+output scale of `1.1`. The compensated profile matched cubic over three 200-step
+seeds (`-0.00107` mean loss, `-3.7%` optimizer time), but lost both matched
+1,000-step gates: mean validation loss rose from `4.23929` to `4.24816` while
+optimizer time fell only 2.1% and total step time 0.9%. Cubic therefore remains
+the retained output retraction. The component measurements, curves, source
+paths, and decisions are in
+`../optimizer_replay_results/transport_output_retraction_768_summary.json`.
+
+The next experiment amortized the skew controller itself. In the retained
+period-eight-anchor, period-four-check schedule, only the step-three signal can
+request a controller-only anchor; step seven precedes the fixed step-eight
+anchor. The opt-in fast path uses the ordinary local-output kernel on the other
+six warm steps. At `768x768` and `768x2048`, this reduced the exact warm-cycle
+component cost by 16.8% and 18.5%. Across three 1,000-step seeds it reduced mean
+optimizer time by 15.9% and total step time by 3.9%, but validation loss rose
+from `4.23854` to `4.24409` (`+0.00555`). It therefore remains disabled and is
+recorded as a rejected speed/quality tradeoff. A follow-up should keep one
+compiled direction path on every warm step and move only the diagnostic
+reduction behind the cadence gate.
+
+That follow-up is now implemented behind
+`muon_warm_separate_skew_signal=True`. The direction graph returns its existing
+raw skew and alignment intermediates on every warm step; only the useful
+period-four check reduces them to an FP32 scalar. This keeps one direction
+kernel and does not rebuild the Gram product. At `768x768` and `768x2048`, its
+exact warm-cycle savings are 13.4% and 12.6%. The first 1,000-step seed saves
+16.6% optimizer time and 3.0% total step time, but ends at `4.24671` versus
+`4.23989` for the retained control. Seeds 456 and 789 remain required before a
+decision; the current aggregate is
+`../optimizer_replay_results/transport_skew_signal_terms_cadence_768_summary.json`.
 
 Long runs support atomic rolling checkpoints with exact shuffled-data position,
 model, optimizer, scheduler, and RNG state:
