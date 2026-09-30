@@ -40,6 +40,8 @@ def test_local_optimizer_is_the_default():
     assert args.soap_residual_threshold == 0.0
     assert args.soap_residual_max_age == 40
     assert args.soap_residual_warmup_steps == 0
+    assert not args.soap_basis_lr_age_compensation
+    assert args.soap_basis_lr_reference_age == 0
     assert args.soap_reset_max_age == 0
     assert args.muon_retract_steps == 1
     assert args.muon_retract_method == "higham_cubic"

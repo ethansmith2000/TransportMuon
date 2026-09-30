@@ -502,6 +502,8 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace, device: torch.de
             precondition_mode=args.soap_precondition_mode,
             precondition_aspect_ratio=args.soap_precondition_aspect_ratio,
             normalize_grads=args.soap_normalize_grads,
+            basis_lr_age_compensation=args.soap_basis_lr_age_compensation,
+            basis_lr_reference_age=args.soap_basis_lr_reference_age,
             basis_reset_frequency=args.soap_reset_frequency,
             basis_reset_max_age=args.soap_reset_max_age,
             basis_reset_stagger=args.soap_reset_stagger,
@@ -541,6 +543,8 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
     basis_residual_threshold_refreshes = basis_residual_max_age_refreshes = 0
     basis_residual_ratio_sum = basis_residual_ratio_max = 0.0
     basis_residual_ratio_samples: list[float] = []
+    basis_effective_lr_samples = 0
+    basis_effective_lr_sum = basis_effective_lr_max = 0.0
     hard_reset_events = hard_reset_factors = 0
     reset_first_refreshes: list[int] = []
     reset_first_steps: list[int] = []
@@ -637,6 +641,18 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
         basis_active_refreshes += int(
             state.get("basis_active_refreshes", 0)
         )
+        state_effective_lr_samples = int(
+            state.get("basis_effective_lr_samples", 0)
+        )
+        basis_effective_lr_samples += state_effective_lr_samples
+        if state_effective_lr_samples > 0:
+            basis_effective_lr_sum += float(
+                state.get("basis_effective_lr_sum", 0.0)
+            )
+            basis_effective_lr_max = max(
+                basis_effective_lr_max,
+                float(state.get("basis_effective_lr_max", 0.0)),
+            )
         state_residual_checks = int(state.get("basis_residual_checks", 0))
         basis_residual_checks += state_residual_checks
         basis_residual_skips += int(state.get("basis_residual_skips", 0))
@@ -890,6 +906,14 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
                 "p90": _percentile(basis_residual_ratio_samples, 0.90),
                 "p95": _percentile(basis_residual_ratio_samples, 0.95),
             }
+    if basis_effective_lr_samples > 0:
+        diagnostics["basis_tracker_step"] = {
+            "samples": basis_effective_lr_samples,
+            "mean_effective_lr": (
+                basis_effective_lr_sum / basis_effective_lr_samples
+            ),
+            "maximum_effective_lr": basis_effective_lr_max,
+        }
     if update_elements > 0:
         direction_sq = statistic_sums["muon_update_direction_sq_sum_tensor"]
         momentum_sq = statistic_sums["muon_update_momentum_sq_sum_tensor"]
@@ -1995,6 +2019,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--soap-precondition-aspect-ratio", type=float, default=2.0)
     parser.add_argument("--soap-max-precond-dim", type=int, default=10_000)
     parser.add_argument("--soap-normalize-grads", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--soap-basis-lr-age-compensation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--soap-basis-lr-reference-age", type=int, default=0)
     parser.add_argument("--soap-reset-frequency", type=int, default=20)
     parser.add_argument("--soap-reset-max-age", type=int, default=0)
     parser.add_argument(
