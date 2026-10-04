@@ -160,6 +160,75 @@ def test_exact_optimizer_loader_preserves_nested_cache_dtype():
     )
 
 
+def test_completed_checkpoint_can_finalize_missing_result(tmp_path):
+    path = tmp_path / 'completed.pt'
+    control = train(_tiny_resume_args(path))
+    saved_bytes = path.read_bytes()
+    args = _tiny_resume_args(path)
+    args.resume = path
+    finalized = train(args)
+    assert finalized['progress']['completed']
+    assert finalized['progress']['resumed_from_step'] == args.steps
+    assert finalized['history'] == control['history']
+    assert finalized['final']['validation_loss'] == control['final']['validation_loss']
+    assert path.read_bytes() == saved_bytes
+
+
+def test_tracker_step_diagnostics_exclude_unpreconditioned_parameters():
+    matrix = torch.nn.Parameter(torch.zeros(2, 2))
+    vector = torch.nn.Parameter(torch.zeros(2))
+    optimizer = torch.optim.SGD([matrix, vector], lr=.1)
+    optimizer.state[matrix] = {
+        'Q': [torch.eye(2), None], 'basis_effective_lr_samples': 2,
+        'basis_effective_lr_sum': 1.25, 'basis_effective_lr_max': .75,
+    }
+    optimizer.state[vector] = {
+        'Q': [None], 'basis_effective_lr_samples': 100,
+        'basis_effective_lr_sum': 50., 'basis_effective_lr_max': .5,
+    }
+    stats = optimizer_diagnostics(optimizer)['basis_tracker_step']
+    assert stats == {'samples': 2, 'mean_effective_lr': .625,
+                     'maximum_effective_lr': .75}
+
+
+def test_local_optimizer_resume_crosses_refresh_reset_and_epoch(tmp_path):
+    def args_for(path):
+        args = _tiny_resume_args(path)
+        args.optimizer = build_parser().parse_args([]).optimizer
+        args.steps = 13
+        args.soap_precondition_frequency = 2
+        args.soap_precondition_frequency_after_warmup = 4
+        args.soap_precondition_frequency_warmup_steps = 4
+        args.soap_basis_lr_age_compensation = True
+        args.soap_basis_lr_reference_age = 2
+        args.soap_reset_frequency = 2
+        args.soap_reset_max_age = 4
+        args.soap_reset_stagger = True
+        args.muon_full_ns_steps = 0
+        args.muon_anchor_every = 4
+        args.muon_split_qkv = True
+        args.muon_split_swiglu = True
+        return args
+
+    control_path = tmp_path / 'local_control.pt'
+    resumed_path = tmp_path / 'local_resumed.pt'
+    # Exercise real optimizer code eagerly; compiled CUDA equivalence is a
+    # separate hardware check, not a claim made by this CPU regression test.
+    with torch.compiler.set_stance('force_eager'):
+        control = train(args_for(control_path))
+        interrupted = args_for(resumed_path)
+        interrupted.stop_after_step = 5
+        train(interrupted)
+        resumed_args = args_for(resumed_path)
+        resumed_args.resume = resumed_path
+        resumed = train(resumed_args)
+    assert control['history'] == resumed['history']
+    full = torch.load(control_path, weights_only=False)
+    restarted = torch.load(resumed_path, weights_only=False)
+    for key in ('model', 'optimizer', 'scheduler', 'data_stream', 'rng'):
+        _assert_nested_equal(full[key], restarted[key])
+
+
 class _TinyTokenizer:
     eos_token_id = 99
     pad_token_id = None

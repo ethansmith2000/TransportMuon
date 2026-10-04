@@ -644,6 +644,10 @@ def optimizer_diagnostics(optimizer) -> dict[str, Any]:
         state_effective_lr_samples = int(
             state.get("basis_effective_lr_samples", 0)
         )
+        if not any(factor is not None for factor in state.get("Q", ())):
+            # Fallback Adam parameters share the cadence bookkeeping but do
+            # not execute a basis step. Exclude their nominal eta samples.
+            state_effective_lr_samples = 0
         basis_effective_lr_samples += state_effective_lr_samples
         if state_effective_lr_samples > 0:
             basis_effective_lr_sum += float(
@@ -1563,16 +1567,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     ) if args.compile else model
 
     start_step = int(resume_checkpoint["step"]) if resume_checkpoint else 0
-    if not 0 <= start_step < args.steps:
+    if not 0 <= start_step <= args.steps:
         raise ValueError(
-            f"resume step {start_step} must be smaller than target steps {args.steps}"
+            f"resume step {start_step} must not exceed target steps {args.steps}"
         )
     execution_end = (
         min(args.steps, args.stop_after_step)
         if args.stop_after_step > 0
         else args.steps
     )
-    if execution_end <= start_step:
+    if execution_end <= start_step and not (
+        start_step == execution_end == args.steps and resume_checkpoint is not None
+    ):
         raise ValueError(
             f"stop_after_step {execution_end} must exceed resume step {start_step}"
         )

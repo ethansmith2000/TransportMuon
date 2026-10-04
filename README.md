@@ -750,17 +750,17 @@ model, optimizer, scheduler, and RNG state:
 ```
 
 Keep the original target `--steps` and schedule when resuming. CPU controls are
-bitwise exact across an interruption, including an epoch boundary. Compiled CUDA
-controls reproduce every logged loss and controller event; reconstruction can
-change final FP32 state by about `1e-9` because GPU reduction order is not
-bitwise fixed. Exact checkpointing rejects asynchronous Muon checks because a
+bitwise exact across an interruption, including an epoch boundary. The original torch 2.12.0+cu130 compiled CUDA
+controls reproduced every logged loss and controller event, with FP32 state
+differences around `1e-9`. This is environment-specific evidence, not a bitwise
+CUDA guarantee; revalidate numerical replay after software or hardware changes. Exact checkpointing rejects asynchronous Muon checks because a
 pending CUDA event cannot be serialized faithfully.
 
 `--hf-streaming` reads only the bounded sample. `--max-train-tokens` and
 `--max-validation-tokens` cap RAM and token-cache usage, while `--token-cache`
 stores token IDs as int32 and avoids repeated network reads and tokenization
-across seeds. Batches are promoted to int64 only when loaded for embedding
-lookup. Eager loading of
+across seeds. The packed dataset currently expands the token stream to int64 in CPU RAM;
+the persistent cache remains int32. Eager loading of
 `Skylion007/openwebtext` is rejected unless `--allow-large-hf-download` is passed,
 because the complete download plus generated dataset can occupy about 64 GB.
 
@@ -769,3 +769,29 @@ checkpoint output, cosine/constant schedules, mixed precision, optional model
 compilation, validation, CUDA timing, peak memory, optimizer-state size, and
 Transport Muon anchor diagnostics. Embeddings and the tied LM head use the Adam
 branch; internal matrix projections use Transport Muon.
+
+### Receiving-device audit (2026-09-30)
+
+Independent probes confirm tall/wide orientation and complementary subspace
+motion. A new CPU regression verifies exact local-optimizer resume with logical
+QKV/SwiGLU state across anchors and a shuffled-epoch boundary. The matched
+full-anchor baseline remains `muon_warm_anchor_every=1` with identical anchor
+polishing and output normalization. Adaptive signal checks still synchronize
+once per checked device batch; the power estimate is heuristic.
+
+The completed-checkpoint recovery path can now regenerate missing result JSON
+without training again. SOAP gate completion metadata and active-only basis eta statistics are also
+covered by the shared audit. Shared trainer/model/test
+files remain byte-identical between repositories. Final CPU suites: 97
+TransportMuon tests and 66 TurboSOAP tests. No model weights are retained.
+
+### Current LLM evaluation check (2026-10-01)
+
+The shared 768x8 trainer passed same-weight evaluation checks at steps 100,
+200 and 1,000 on torch 2.11.0+cu128: maximum compiled/eager BF16 validation CE
+difference 2.9e-5, identical repeated compiled losses, and identical eager
+first-batch grad/no-grad losses. Model hashes were unchanged by diagnostics.
+This supports the tested current trajectory; unsaved historical weights and
+other architectures/software were not validated. The run used SOAP; it tests
+the shared model/evaluator, not every optimizer trajectory.
+See [the foundation report](../optimizer_replay_results/soap_budget_20261001/README.md).
